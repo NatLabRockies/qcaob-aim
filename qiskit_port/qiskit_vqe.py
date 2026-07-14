@@ -142,5 +142,420 @@ def get_initial_occupations_indices_qiskit(
 
 
 
+from qiskit.quantum_info import Statevector
+
+from qiskit_port.qiskit_ansatz import all_symmetry_ansatzae_qiskit
 
 
+def construct_vqe_gs_qiskit(
+    n_qubits,
+    up_qubit_indices,
+    down_qubit_indices,
+    vqe_depth,
+    connected_graphs,
+    minimum_angles,
+    vqe_nu,
+    vqe_nd,
+):
+    """
+    Reconstruct a variational state from previously determined ansatz angles.
+
+    Qiskit equivalent of vqe.construct_vqe_gs().
+    """
+
+    initial_occupations_indices = get_initial_occupations_indices_qiskit(
+        up_qubit_indices,
+        down_qubit_indices,
+        vqe_nu,
+        vqe_nd,
+    )
+
+    circuit = all_symmetry_ansatzae_qiskit(
+        theta=minimum_angles,
+        n_qubits=n_qubits,
+        n_layers=vqe_depth,
+        initial_occupations_indices=initial_occupations_indices,
+        connected_graphs=connected_graphs,
+        compilation="generic",
+    )
+
+    statevector = Statevector.from_instruction(circuit)
+    state_array = statevector.data.copy()
+
+    return statevector, state_array
+
+import numpy as np
+from qiskit.quantum_info import Statevector
+
+
+def _apply_jordan_wigner_project_flip(
+    state,
+    impurity_orbital,
+    occupied_projector,
+):
+    """
+    Apply the Jordan-Wigner parity string, project onto the requested
+    impurity occupation, and flip the impurity qubit.
+
+    occupied_projector=True corresponds to P1 followed by X.
+    occupied_projector=False corresponds to P0 followed by X.
+    """
+    state = np.asarray(state, dtype=complex)
+    output = np.zeros_like(state)
+
+    for basis_index, amplitude in enumerate(state):
+        impurity_bit = (basis_index >> impurity_orbital) & 1
+
+        required_bit = 1 if occupied_projector else 0
+
+        # P1 or P0 projection
+        if impurity_bit != required_bit:
+            continue
+
+        # Jordan-Wigner Z string on qubits below the impurity orbital
+        parity = 1.0
+
+        for qubit in range(impurity_orbital):
+            bit = (basis_index >> qubit) & 1
+
+            if bit == 1:
+                parity *= -1.0
+
+        # X gate flips the impurity qubit
+        flipped_index = basis_index ^ (1 << impurity_orbital)
+
+        output[flipped_index] += parity * amplitude
+
+    norm = np.linalg.norm(output)
+
+    if norm == 0:
+        raise ValueError(
+            "The projected Krylov zero state has zero norm."
+        )
+
+    output /= norm
+
+    return output, norm
+
+
+def vqe_krylov_zero_state_qiskit(
+    vqe_gs,
+    impurity_orbital,
+    n_qubits,
+):
+    """
+    Qiskit equivalent of vqe.vqe_krylov_zero_state().
+
+    Creates normalized particle-removal and particle-addition
+    Krylov zero states from the reconstructed VQE state.
+    """
+    if isinstance(vqe_gs, Statevector):
+        ground_state = vqe_gs.data
+    else:
+        ground_state = np.asarray(vqe_gs, dtype=complex)
+
+    expected_dimension = 2**n_qubits
+
+    if ground_state.size != expected_dimension:
+        raise ValueError(
+            f"Expected a statevector of length {expected_dimension}, "
+            f"but received length {ground_state.size}."
+        )
+
+    # Phi minus: Jordan-Wigner parity string, P1, then X
+    phi_minus_array, phi_minus_norm = (
+        _apply_jordan_wigner_project_flip(
+            state=ground_state,
+            impurity_orbital=impurity_orbital,
+            occupied_projector=True,
+        )
+    )
+
+    # Phi plus: Jordan-Wigner parity string, P0, then X
+    phi_plus_array, phi_plus_norm = (
+        _apply_jordan_wigner_project_flip(
+            state=ground_state,
+            impurity_orbital=impurity_orbital,
+            occupied_projector=False,
+        )
+    )
+
+    phi_minus = Statevector(phi_minus_array)
+    phi_plus = Statevector(phi_plus_array)
+
+    record_keeping = {
+        "phi_plus_norm": phi_plus_norm,
+        "phi_plus_normalized": np.linalg.norm(phi_plus_array),
+        "phi_minus_norm": phi_minus_norm,
+        "phi_minus_normalized": np.linalg.norm(phi_minus_array),
+    }
+
+    return (
+        phi_minus,
+        phi_minus_array,
+        phi_minus_norm,
+        phi_plus,
+        phi_plus_array,
+        phi_plus_norm,
+        record_keeping,
+    )
+
+
+import numpy as np
+from qiskit.quantum_info import Statevector
+
+from qiskit_port.qiskit_ansatz import all_symmetry_ansatzae_qiskit
+
+
+def lanczos_cost_function_qiskit(
+    params,
+    Hmat,
+    ut,
+    b,
+    i,
+    n_layers,
+    initial_occupations_indices,
+    connected_graphs,
+    n_qubits,
+    compilation="generic",
+):
+    """
+    Qiskit equivalent of vqe.lanczos_cost_function().
+    """
+
+    circuit = all_symmetry_ansatzae_qiskit(
+        theta=params,
+        n_qubits=n_qubits,
+        n_layers=n_layers,
+        initial_occupations_indices=initial_occupations_indices,
+        connected_graphs=connected_graphs,
+        compilation=compilation,
+    )
+
+    # Raw Qiskit statevector
+    ws_raw = Statevector.from_instruction(circuit).data
+
+    # OpenFermion matrices require the reversed bit ordering
+    ws_ordered = qulacs_to_python_ordering_qiskit(
+        ws_raw,
+        n_qubits,
+    )
+
+    previous_ordered = qulacs_to_python_ordering_qiskit(
+        ut[i - 1],
+        n_qubits,
+    )
+
+    # Enforce <ws|H|u_(i-1)> = b_i
+    e1 = abs(
+        np.vdot(
+            ws_ordered,
+            Hmat @ previous_ordered,
+        )
+        - b[i]
+    )
+
+    # Overlaps can be calculated directly in raw statevector ordering
+    e2 = abs(np.vdot(ws_raw, ut[i - 1]))
+
+    if i > 1:
+        e3 = abs(np.vdot(ws_raw, ut[i - 2]))
+    else:
+        e3 = 0.0
+
+    e4 = 0.0
+
+    if i == 4:
+        e4 += abs(np.vdot(ws_raw, ut[1])) ** 2
+
+    if i >= 5:
+        for j in range(3, 6):
+            e4 += abs(np.vdot(ws_raw, ut[i - j])) ** 2
+
+    cost = e1**2 + e2**2 + e3**2 + e4
+
+    return float(np.real(cost))
+
+
+from scipy.optimize import minimize
+
+
+def vqe_ideal_lanczos_iterations_qiskit(
+    niter,
+    u,
+    Hmat,
+    H2mat,
+    charge_sec,
+    spin_sec,
+    n_layers,
+    up_qubit_indices,
+    down_qubit_indices,
+    connected_graphs,
+    conv_tol=1e-6,
+    optimizer="COBYLA",
+    maxiter=2000,
+    gf_gtol=5e-5,
+):
+    """
+    Qiskit equivalent of vqe.vqe_ideal_lanczos_iterations().
+
+    Parameters
+    ----------
+    u
+        Initial Krylov statevector in raw Qiskit/Qulacs ordering.
+    Hmat, H2mat
+        Shifted Hamiltonian matrices in OpenFermion matrix ordering.
+    """
+
+    u = np.asarray(
+        u.data if isinstance(u, Statevector) else u,
+        dtype=complex,
+    )
+
+    n_qubits = int(np.log2(u.size))
+    n_edges = connected_graphs["graph_full"].number_of_edges()
+
+    n_up = (charge_sec + spin_sec) // 2
+    n_down = (charge_sec - spin_sec) // 2
+
+    initial_occupations_indices = (
+        get_initial_occupations_indices_qiskit(
+            up_qubit_indices,
+            down_qubit_indices,
+            n_up,
+            n_down,
+        )
+    )
+
+    compilation = "generic"
+
+    a = np.zeros(niter + 1, dtype=np.complex128)
+    b = np.zeros(niter + 1, dtype=np.complex128)
+
+    ut = [u.copy()]
+    b[0] = 0.0
+
+    # Hmat uses reordered state indexing
+    u0_ordered = qulacs_to_python_ordering_qiskit(
+        ut[0],
+        n_qubits,
+    )
+
+    a[0] = np.vdot(
+        u0_ordered,
+        Hmat @ u0_ordered,
+    )
+
+    iteration_results = {}
+
+    for i in range(1, niter + 1):
+        previous_ordered = qulacs_to_python_ordering_qiskit(
+            ut[i - 1],
+            n_qubits,
+        )
+
+        h2_expectation = np.vdot(
+            previous_ordered,
+            H2mat @ previous_ordered,
+        )
+
+        if i == 1:
+            b_squared = (
+                h2_expectation
+                - a[i - 1] ** 2
+            )
+        else:
+            b_squared = (
+                h2_expectation
+                - a[i - 1] ** 2
+                - b[i - 1] ** 2
+            )
+
+        # Remove tiny negative numerical noise
+        if abs(b_squared.imag) < 1e-12:
+            b_squared = b_squared.real
+
+        if np.isreal(b_squared) and b_squared < 0:
+            if abs(b_squared) < 1e-10:
+                b_squared = 0.0
+            else:
+                raise ValueError(
+                    f"Negative b² encountered at iteration {i}: "
+                    f"{b_squared}"
+                )
+
+        b[i] = np.sqrt(b_squared)
+
+        if np.isclose(b[i], 0.0):
+            break
+
+        n_params = n_layers * (n_edges + n_qubits)
+
+        theta_0 = np.random.uniform(
+            low=0.0,
+            high=2.0 * np.pi,
+            size=n_params,
+        )
+
+        opt_args = (
+            Hmat,
+            ut,
+            b,
+            i,
+            n_layers,
+            initial_occupations_indices,
+            connected_graphs,
+            n_qubits,
+            compilation,
+        )
+
+        result = minimize(
+            lanczos_cost_function_qiskit,
+            theta_0,
+            args=opt_args,
+            method=optimizer,
+            tol=conv_tol,
+            options={
+                "maxiter": int(maxiter),
+                "gtol": gf_gtol,
+                "eps": 1e-7,
+            },
+        )
+
+        circuit = all_symmetry_ansatzae_qiskit(
+            theta=result.x,
+            n_qubits=n_qubits,
+            n_layers=n_layers,
+            initial_occupations_indices=(
+                initial_occupations_indices
+            ),
+            connected_graphs=connected_graphs,
+            compilation=compilation,
+        )
+
+        new_state = Statevector.from_instruction(circuit).data
+        new_state = new_state / np.linalg.norm(new_state)
+
+        ut.append(new_state.copy())
+
+        new_state_ordered = (
+            qulacs_to_python_ordering_qiskit(
+                new_state,
+                n_qubits,
+            )
+        )
+
+        a[i] = np.vdot(
+            new_state_ordered,
+            Hmat @ new_state_ordered,
+        )
+
+        iteration_results[i] = {
+            "message": result.message,
+            "success": result.success,
+            "status": result.status,
+            "fun": result.fun,
+            "parameters": result.x,
+        }
+
+    return a, b, iteration_results, ut
