@@ -638,7 +638,6 @@ def plot_gfs(
     plt.xlabel(r"$\omega$")
     plt.ylabel(r"$G^{ret}_%s(\omega)$" % impurity_orbital)
     plt.title(r"$n_{layers}=%s, gtol=%s$, %s, GF rel err=%.3f" % (vqe_depth, gtol, optimizer, relative_error))
-    plt.xlim(4,5)
     plt.show()
 
     return None
