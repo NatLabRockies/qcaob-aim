@@ -13,6 +13,7 @@ qiskit_vqe.py -- same implementation, same behavior, just relocated so
 it can be shared without pulling in the optimizer/Lanczos machinery
 that used to live in the same file.
 """
+from functools import lru_cache
 
 import numpy as np
 from openfermion import count_qubits
@@ -40,17 +41,57 @@ def continued_fraction_qiskit(w, a, b):
     return 1.0 / ((w - a[0]) - b[1] ** 2 * continued_fraction_qiskit(w, a[1:], b[1:]))
 
 
-def qulacs_to_python_ordering_qiskit(qulacs_state, n_qubits):
-    new_state = np.zeros(qulacs_state.shape, dtype=complex)
+@lru_cache(maxsize=None)
+def _bit_reverse_indices(n_qubits):
+    """
+    Return the bit-reversal permutation for n_qubits.
 
-    for ii in range(qulacs_state.shape[0]):
-        format_string = "{0:0" + str(n_qubits) + "b}"
-        b_string = format_string.format(ii)
-        b_reversed = b_string[::-1]
-        new_ii = int(b_reversed, 2)
-        new_state[new_ii] = qulacs_state[ii]
+    Cached because this permutation is identical every time for a
+    fixed qubit count.
+    """
+    dimension = 1 << n_qubits
 
-    return new_state
+    return np.array(
+        [
+            int(
+                f"{i:0{n_qubits}b}"[::-1],
+                2,
+            )
+            for i in range(dimension)
+        ],
+        dtype=np.int64,
+    )
+
+
+def qulacs_to_python_ordering_qiskit(
+    qulacs_state,
+    n_qubits,
+):
+    """
+    Convert Qiskit/Qulacs circuit ordering to the OpenFermion/Python
+    ordering used by the Hamiltonian matrices.
+
+    This is mathematically identical to the original bit-by-bit loop,
+    but uses a cached NumPy permutation.
+    """
+    state = np.asarray(
+        qulacs_state,
+        dtype=np.complex128,
+    )
+
+    expected_dimension = 1 << n_qubits
+
+    if state.size != expected_dimension:
+        raise ValueError(
+            f"Expected state dimension {expected_dimension}, "
+            f"received {state.size}."
+        )
+
+    permutation = _bit_reverse_indices(
+        n_qubits
+    )
+
+    return state[permutation].copy()
 
 
 def create_qiskit_hamiltonian_matrix(qubit_hamiltonian, vqe_gs_energy):

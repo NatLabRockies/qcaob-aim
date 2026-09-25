@@ -16,10 +16,25 @@ that can silently drift apart.
 """
 
 import numpy as np
-from scipy.optimize import minimize
-from qiskit.quantum_info import Statevector
 
-from qiskit_port.qiskit_ansatz import all_symmetry_ansatzae_qiskit
+from scipy.optimize import minimize, Bounds
+
+from qiskit.quantum_info import Statevector
+from qiskit.circuit import ParameterVector
+
+# Optional faster statevector backend.
+# Falls back to Statevector.from_instruction if qiskit-aer
+# is not installed.
+try:
+    from qiskit_aer import AerSimulator
+except ImportError:
+    AerSimulator = None
+
+
+from qiskit_port.qiskit_ansatz import (
+    all_symmetry_ansatzae_qiskit,
+)
+
 from qiskit_port.qiskit_utils import (
     expectation_value,
     overlap,
@@ -29,8 +44,228 @@ from qiskit_port.qiskit_utils import (
     create_qiskit_hamiltonian_matrix,
     get_initial_occupations_indices_qiskit,
 )
-from n_site_graph_creation import create_connected_graphs, AIMSiteModelsEnum
 
+from n_site_graph_creation import (
+    create_connected_graphs,
+    AIMSiteModelsEnum,
+)
+
+
+# ============================================================
+# FAST STATEVECTOR BACKEND
+#
+# The mathematical ansatz is unchanged.
+#
+# Instead of rebuilding a fully numeric QuantumCircuit and calling
+# Statevector.from_instruction() thousands/millions of times, cache
+# one parameterized circuit for each ansatz configuration and bind
+# new theta values into it.
+# ============================================================
+
+_AER_STATEVECTOR_BACKEND = (
+    AerSimulator(method="statevector")
+    if AerSimulator is not None
+    else None
+)
+
+_ANSATZ_TEMPLATE_CACHE = {}
+
+
+def _connected_graph_signature(
+    connected_graphs,
+):
+    """
+    Hashable signature that preserves the SAME edge iteration order
+    used by all_symmetry_ansatzae_qiskit().
+    """
+    return tuple(
+        (
+            graph_name,
+            tuple(
+                (
+                    int(edge[0]),
+                    int(edge[1]),
+                )
+                for edge in connected_graphs[
+                    graph_name
+                ].edges()
+            ),
+        )
+        for graph_name in (
+            "graph_up",
+            "graph_down",
+            "graph_stitch",
+        )
+    )
+
+
+def _ansatz_cache_key(
+    n_qubits,
+    n_layers,
+    initial_occupations_indices,
+    connected_graphs,
+    compilation,
+):
+    return (
+        int(n_qubits),
+        int(n_layers),
+        tuple(
+            int(x)
+            for x in initial_occupations_indices
+        ),
+        _connected_graph_signature(
+            connected_graphs
+        ),
+        str(compilation),
+    )
+
+
+def _get_parameterized_ansatz_template(
+    n_qubits,
+    n_layers,
+    initial_occupations_indices,
+    connected_graphs,
+    compilation="generic",
+):
+    """
+    Build a parameterized ansatz once and cache it.
+    """
+    key = _ansatz_cache_key(
+        n_qubits=n_qubits,
+        n_layers=n_layers,
+        initial_occupations_indices=(
+            initial_occupations_indices
+        ),
+        connected_graphs=connected_graphs,
+        compilation=compilation,
+    )
+
+    if key in _ANSATZ_TEMPLATE_CACHE:
+        return _ANSATZ_TEMPLATE_CACHE[key]
+
+    n_edges = sum(
+        connected_graphs[name].number_of_edges()
+        for name in (
+            "graph_up",
+            "graph_down",
+            "graph_stitch",
+        )
+    )
+
+    n_params = (
+        n_layers
+        * (
+            n_edges
+            + n_qubits
+        )
+    )
+
+    parameters = ParameterVector(
+        "theta",
+        n_params,
+    )
+
+    circuit = all_symmetry_ansatzae_qiskit(
+        theta=parameters,
+        n_qubits=n_qubits,
+        n_layers=n_layers,
+        initial_occupations_indices=(
+            initial_occupations_indices
+        ),
+        connected_graphs=connected_graphs,
+        compilation=compilation,
+    )
+
+    if _AER_STATEVECTOR_BACKEND is not None:
+        circuit.save_statevector()
+
+    _ANSATZ_TEMPLATE_CACHE[key] = (
+        circuit,
+        parameters,
+    )
+
+    return circuit, parameters
+
+
+def _simulate_ansatz_state_qiskit(
+    theta,
+    n_qubits,
+    n_layers,
+    initial_occupations_indices,
+    connected_graphs,
+    compilation="generic",
+):
+    """
+    Return the RAW Qiskit-order statevector for the symmetry-preserving
+    ansatz.
+
+    Aer is used when available. Statevector.from_instruction remains
+    as a compatibility fallback.
+    """
+    theta = np.asarray(
+        theta,
+        dtype=float,
+    )
+
+    if _AER_STATEVECTOR_BACKEND is None:
+
+        circuit = all_symmetry_ansatzae_qiskit(
+            theta=theta,
+            n_qubits=n_qubits,
+            n_layers=n_layers,
+            initial_occupations_indices=(
+                initial_occupations_indices
+            ),
+            connected_graphs=connected_graphs,
+            compilation=compilation,
+        )
+
+        return (
+            Statevector
+            .from_instruction(circuit)
+            .data
+            .copy()
+        )
+
+    circuit, parameters = (
+        _get_parameterized_ansatz_template(
+            n_qubits=n_qubits,
+            n_layers=n_layers,
+            initial_occupations_indices=(
+                initial_occupations_indices
+            ),
+            connected_graphs=connected_graphs,
+            compilation=compilation,
+        )
+    )
+
+    if theta.size != len(parameters):
+        raise ValueError(
+            f"Expected {len(parameters)} ansatz parameters, "
+            f"received {theta.size}."
+        )
+
+    parameter_map = {
+        parameter: float(value)
+        for parameter, value
+        in zip(parameters, theta)
+    }
+
+    bound_circuit = circuit.assign_parameters(
+        parameter_map,
+        inplace=False,
+    )
+
+    result = _AER_STATEVECTOR_BACKEND.run(
+        bound_circuit
+    ).result()
+
+    state = np.asarray(
+        result.data(0)["statevector"],
+        dtype=np.complex128,
+    )
+
+    return state.copy()
 
 def construct_vqe_gs_qiskit(
     n_qubits,
@@ -42,32 +277,34 @@ def construct_vqe_gs_qiskit(
     vqe_nu,
     vqe_nd,
 ):
-    """
-    Reconstruct a variational state from previously determined ansatz angles.
-
-    Qiskit equivalent of vqe.construct_vqe_gs().
-    """
-
-    initial_occupations_indices = get_initial_occupations_indices_qiskit(
-        up_qubit_indices,
-        down_qubit_indices,
-        vqe_nu,
-        vqe_nd,
+    initial_occupations_indices = (
+        get_initial_occupations_indices_qiskit(
+            up_qubit_indices,
+            down_qubit_indices,
+            vqe_nu,
+            vqe_nd,
+        )
     )
 
-    circuit = all_symmetry_ansatzae_qiskit(
+    state_array = _simulate_ansatz_state_qiskit(
         theta=minimum_angles,
         n_qubits=n_qubits,
         n_layers=vqe_depth,
-        initial_occupations_indices=initial_occupations_indices,
+        initial_occupations_indices=(
+            initial_occupations_indices
+        ),
         connected_graphs=connected_graphs,
         compilation="generic",
     )
 
-    statevector = Statevector.from_instruction(circuit)
-    state_array = statevector.data.copy()
+    statevector = Statevector(
+        state_array
+    )
 
-    return statevector, state_array
+    return (
+        statevector,
+        state_array.copy(),
+    )
 
 
 def _apply_jordan_wigner_project_flip(
@@ -183,6 +420,7 @@ def vqe_krylov_zero_state_qiskit(
     )
 
 
+
 def lanczos_cost_function_qiskit(
     params,
     Hmat,
@@ -194,63 +432,114 @@ def lanczos_cost_function_qiskit(
     connected_graphs,
     n_qubits,
     compilation="generic",
+    h_previous_raw=None,
 ):
     """
     Qiskit equivalent of vqe.lanczos_cost_function().
+
+    Krylov vectors remain in RAW Qiskit/Qulacs ordering.
+
+    The optional h_previous_raw contains
+
+        P H P |u_(i-1)>
+
+    where P is the bit-reversal permutation. Since this quantity is
+    invariant during one optimizer run, calculating it once outside
+    scipy.optimize avoids repeating ordering conversion and H @ u on
+    every cost-function evaluation.
     """
 
-    circuit = all_symmetry_ansatzae_qiskit(
+    ws_raw = _simulate_ansatz_state_qiskit(
         theta=params,
         n_qubits=n_qubits,
         n_layers=n_layers,
-        initial_occupations_indices=initial_occupations_indices,
+        initial_occupations_indices=(
+            initial_occupations_indices
+        ),
         connected_graphs=connected_graphs,
         compilation=compilation,
     )
 
-    # Raw Qiskit statevector
-    ws_raw = Statevector.from_instruction(circuit).data
+    if h_previous_raw is None:
 
-    # OpenFermion matrices require the reversed bit ordering
-    ws_ordered = qulacs_to_python_ordering_qiskit(
-        ws_raw,
-        n_qubits,
-    )
+        previous_ordered = (
+            qulacs_to_python_ordering_qiskit(
+                ut[i - 1],
+                n_qubits,
+            )
+        )
 
-    previous_ordered = qulacs_to_python_ordering_qiskit(
-        ut[i - 1],
-        n_qubits,
-    )
+        h_previous_ordered = (
+            Hmat
+            @ previous_ordered
+        )
 
-    # Enforce <ws|H|u_(i-1)> = b_i
+        h_previous_raw = (
+            qulacs_to_python_ordering_qiskit(
+                h_previous_ordered,
+                n_qubits,
+            )
+        )
+
+    # Equivalent to
+    #
+    # <P ws | H | P u_(i-1)> - b_i
+    #
+    # because P is a self-inverse permutation.
     e1 = abs(
         np.vdot(
-            ws_ordered,
-            Hmat @ previous_ordered,
+            ws_raw,
+            h_previous_raw,
         )
         - b[i]
     )
 
-    # Overlaps can be calculated directly in raw statevector ordering
-    e2 = abs(np.vdot(ws_raw, ut[i - 1]))
+    e2 = abs(
+        np.vdot(
+            ws_raw,
+            ut[i - 1],
+        )
+    )
 
     if i > 1:
-        e3 = abs(np.vdot(ws_raw, ut[i - 2]))
+        e3 = abs(
+            np.vdot(
+                ws_raw,
+                ut[i - 2],
+            )
+        )
     else:
         e3 = 0.0
 
     e4 = 0.0
 
     if i == 4:
-        e4 += abs(np.vdot(ws_raw, ut[1])) ** 2
+        e4 += abs(
+            np.vdot(
+                ws_raw,
+                ut[1],
+            )
+        ) ** 2
 
     if i >= 5:
         for j in range(3, 6):
-            e4 += abs(np.vdot(ws_raw, ut[i - j])) ** 2
+            e4 += abs(
+                np.vdot(
+                    ws_raw,
+                    ut[i - j],
+                )
+            ) ** 2
 
-    cost = e1**2 + e2**2 + e3**2 + e4
+    cost = (
+        e1**2
+        + e2**2
+        + e3**2
+        + e4
+    )
 
-    return float(np.real(cost))
+    return float(
+        np.real(cost)
+    )
 
 
 def vqe_ideal_lanczos_iterations_qiskit(
@@ -265,10 +554,11 @@ def vqe_ideal_lanczos_iterations_qiskit(
     down_qubit_indices,
     connected_graphs,
     conv_tol=1e-6,
-    optimizer="COBYLA",
-    maxiter=2000,
+    optimizer="BFGS",
+    maxiter=1_000_000,
     gf_gtol=5e-5,
     initial_thetas=None,
+    display=False,
 ):
     """
     Qiskit equivalent of vqe.vqe_ideal_lanczos_iterations().
@@ -318,7 +608,7 @@ def vqe_ideal_lanczos_iterations_qiskit(
         Maximum optimizer function-evaluation budget.
 
     gf_gtol : float
-        Retained for compatibility with the original function interface.
+        Gradient-norm tolerance used by the BFGS Green's-function optimizer.
 
     initial_thetas : list[np.ndarray] or None
         Optional fixed starting vectors.
@@ -445,62 +735,94 @@ def vqe_ideal_lanczos_iterations_qiskit(
         # ====================================================
         # CALCULATE b_i
         # ====================================================
-
+        
         previous_ordered = (
             qulacs_to_python_ordering_qiskit(
                 ut[i - 1],
                 n_qubits,
             )
         )
-
+        
+        # ============================================================
+        # H^2 expectation used to calculate b_i
+        # ============================================================
+        
         h2_expectation = np.vdot(
             previous_ordered,
             H2mat @ previous_ordered,
         )
-
+        
+        
+        # ============================================================
+        # H |u_(i-1)> used repeatedly by the optimizer cost function
+        #
+        # This does NOT depend on theta, so calculate it ONCE here
+        # instead of thousands of times inside the cost function.
+        # ============================================================
+        
+        h_previous_ordered = (
+            Hmat @ previous_ordered
+        )
+        
+        # Convert back to RAW Qiskit/Qulacs circuit ordering,
+        # because ws and ut are stored in raw ordering.
+        h_previous_raw = (
+            qulacs_to_python_ordering_qiskit(
+                h_previous_ordered,
+                n_qubits,
+            )
+        )
+        
+        
+        # ============================================================
+        # Calculate b_i
+        # ============================================================
+        
         if i == 1:
-
+        
             b_squared = (
                 h2_expectation
                 - a[i - 1] ** 2
             )
-
+        
         else:
-
+        
             b_squared = (
                 h2_expectation
                 - a[i - 1] ** 2
                 - b[i - 1] ** 2
             )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Match original Qulacs behavior.
-        #
-        # Do NOT:
-        #   - raise an error for negative b_squared
-        #   - take abs(b_squared)
-        #   - force it to zero
-        #
-        # Qulacs uses complex128 Lanczos coefficients, so a
-        # negative real b_squared produces an imaginary b_i.
-        # ----------------------------------------------------
-
+        
+        
+        # Preserve complex behavior while removing only tiny
+        # floating-point imaginary noise.
         b_squared = np.complex128(
             b_squared
         )
-
+        
+        if abs(b_squared.imag) < 1e-12:
+        
+            b_squared = np.complex128(
+                b_squared.real + 0.0j
+            )
+        
+        
         b[i] = np.sqrt(
             b_squared
         )
+
+        if display:
+            print(
+                f"Lanczos {i}/{niter}: "
+                f"a_prev={a[i - 1]:.8g}, "
+                f"b={b[i]:.8g}"
+            )
 
         if np.isclose(
             b[i],
             0.0 + 0.0j,
         ):
             break
-
         # ====================================================
         # NUMBER OF ANSATZ PARAMETERS
         # ====================================================
@@ -562,23 +884,48 @@ def vqe_ideal_lanczos_iterations_qiskit(
             connected_graphs,
             n_qubits,
             compilation,
+            h_previous_raw,
         )
 
+       
         # ====================================================
         # FIRST OPTIMIZATION ATTEMPT
         # ====================================================
-
+        
         lanczos_results = {}
-
+        
+        # ----------------------------------------------------
+        # Match optimizer-specific settings used by the
+        # original Qulacs AIM implementation.
+        #
+        # For BFGS:
+        #   gtol = Green's-function gradient tolerance
+        #   eps  = finite-difference step size
+        #
+        # Do not pass gtol/eps to optimizers such as COBYLA.
+        # ----------------------------------------------------
+        
+        optimizer_options = {
+            "maxiter": int(maxiter),
+        }
+        
+        if optimizer.upper() == "BFGS":
+        
+            optimizer_options.update(
+                {
+                    "gtol": gf_gtol,
+                    "eps": 1e-7,
+                }
+            )
+        
+        
         result = minimize(
             lanczos_cost_function_qiskit,
             theta_0,
             args=opt_args,
             method=optimizer,
             tol=conv_tol,
-            options={
-                "maxiter": int(maxiter),
-            },
+            options=optimizer_options,
         )
 
         lanczos_results[
@@ -631,11 +978,7 @@ def vqe_ideal_lanczos_iterations_qiskit(
                     args=opt_args,
                     method=optimizer,
                     tol=conv_tol,
-                    options={
-                        "maxiter": int(
-                            maxiter
-                        ),
-                    },
+                    options=optimizer_options,
                 )
 
                 lanczos_results[
@@ -673,27 +1016,15 @@ def vqe_ideal_lanczos_iterations_qiskit(
         # BUILD OPTIMIZED KRYLOV STATE
         # ====================================================
 
-        circuit = (
-            all_symmetry_ansatzae_qiskit(
-                theta=result.x,
-                n_qubits=n_qubits,
-                n_layers=n_layers,
-                initial_occupations_indices=(
-                    initial_occupations_indices
-                ),
-                connected_graphs=(
-                    connected_graphs
-                ),
-                compilation=compilation,
-            )
-        )
-
-        new_state = (
-            Statevector
-            .from_instruction(
-                circuit
-            )
-            .data
+        new_state = _simulate_ansatz_state_qiskit(
+            theta=result.x,
+            n_qubits=n_qubits,
+            n_layers=n_layers,
+            initial_occupations_indices=(
+                initial_occupations_indices
+            ),
+            connected_graphs=connected_graphs,
+            compilation=compilation,
         )
 
         # ====================================================
@@ -748,6 +1079,14 @@ def vqe_ideal_lanczos_iterations_qiskit(
         # ====================================================
         # STORE OPTIMIZER INFORMATION
         # ====================================================
+
+        if display:
+            print(
+                f"  optimizer: success={result.success}, "
+                f"attempts={len(lanczos_results)}, "
+                f"nfev={getattr(result, 'nfev', 0)}, "
+                f"fun={result.fun:.6e}"
+            )
 
         iteration_results[i] = {
 
@@ -873,6 +1212,9 @@ def calculate_gf_vqe_qiskit(
     conv_tol: float,
     maxiters: int,
     gf_gtol: float,
+    seed_minus: int = 0,
+    seed_plus: int = 0,
+    display: bool = False,
     **kwargs,
 ):
     """
@@ -880,42 +1222,105 @@ def calculate_gf_vqe_qiskit(
 
     Find the Green's function based on variational Lanczos iterations
     for phi plus or minus, using the Qiskit ansatz/statevector routines
-    instead of Qulacs. Mirrors vqe.calculate_gf_vqe() structurally --
-    same kwarg names and same record_keeping dict keys wherever the two
-    backends share the same underlying quantity (a/b coefficients, the
-    combined Green's function) -- so this can be swapped in wherever
-    vqe.calculate_gf_vqe() is called (e.g. dmft.py's calculate_gf())
-    without dmft.py's backend-agnostic utilities (print_record,
-    save_to_file, calculate_rel_errors) needing any changes.
+    instead of Qulacs.
 
-    :param Hmat: Shifted Hamiltonian matrix (NumPy array), from
-        create_qiskit_hamiltonian_matrix().
-    :param H2mat: Shifted Hamiltonian-squared matrix (NumPy array).
-    :param phi_minus: Initial Krylov vector for phi minus, in raw
-        Qiskit/Qulacs circuit ordering (NumPy array).
-    :param phi_plus: Initial Krylov vector for phi plus, same ordering.
-    :param vqe_charge_minus: Charge sector for phi minus.
-    :param vqe_charge_plus: Charge sector for phi plus.
-    :param vqe_spin_minus: Spin sector for phi minus.
-    :param vqe_spin_plus: Spin sector for phi plus.
-    :param up_qubit_indices: List of spin-up register qubit indices.
-    :param down_qubit_indices: List of spin-down register qubit indices.
-    :param connected_graphs: Dictionary of graph objects representing the AIM.
-    :param w: Complex, linearly-spaced frequency array (with broadening).
-    :param vqe_krylov_ideal_dim_minus: Ideal Krylov dimension for phi minus.
-    :param vqe_krylov_ideal_dim_plus: Ideal Krylov dimension for phi plus.
-    :param phi_minus_norm: Norm of phi minus.
-    :param phi_plus_norm: Norm of phi plus.
-    :param vqe_depth: Number of ansatz layers.
-    :param optimizer: Optimizer name (e.g. "COBYLA").
-    :param conv_tol: Broadly defined convergence tolerance for scipy optimizers.
-    :param maxiters: Max iterations/evaluations for the optimizer.
-    :param gf_gtol: Gradient norm tolerance for the GF optimizer.
-    :return: (g_vqe, record_keeping) -- same shape as vqe.calculate_gf_vqe().
+    Mirrors vqe.calculate_gf_vqe() structurally -- same kwarg names
+    and same record_keeping dict keys wherever the two backends share
+    the same underlying quantity.
+
+    The removal and addition branches use independent random seeds so
+    optimizer retries in one branch cannot change the random starting
+    parameters used by the other branch.
+
+    Parameters
+    ----------
+    Hmat
+        Shifted Hamiltonian matrix.
+
+    H2mat
+        Shifted Hamiltonian-squared matrix.
+
+    phi_minus
+        Initial Krylov vector for the removal branch, in raw
+        Qiskit/Qulacs circuit ordering.
+
+    phi_plus
+        Initial Krylov vector for the addition branch, in raw
+        Qiskit/Qulacs circuit ordering.
+
+    vqe_charge_minus : int
+        Charge sector for phi minus.
+
+    vqe_charge_plus : int
+        Charge sector for phi plus.
+
+    vqe_spin_minus : int
+        Spin sector for phi minus.
+
+    vqe_spin_plus : int
+        Spin sector for phi plus.
+
+    up_qubit_indices : list
+        Spin-up qubit indices.
+
+    down_qubit_indices : list
+        Spin-down qubit indices.
+
+    connected_graphs : dict
+        AIM graph information.
+
+    w
+        Complex frequency grid.
+
+    vqe_krylov_ideal_dim_minus : int
+        Number of variational Lanczos iterations for removal.
+
+    vqe_krylov_ideal_dim_plus : int
+        Number of variational Lanczos iterations for addition.
+
+    phi_minus_norm : float
+        Norm of the unnormalized removal Krylov-zero state.
+
+    phi_plus_norm : float
+        Norm of the unnormalized addition Krylov-zero state.
+
+    vqe_depth : int
+        Number of ansatz layers.
+
+    optimizer : str
+        SciPy optimizer name.
+
+    conv_tol : float
+        General optimizer convergence tolerance.
+
+    maxiters : int
+        Maximum optimizer iterations/evaluations.
+
+    gf_gtol : float
+        Gradient-norm tolerance for the Green's-function optimizer.
+
+    seed_minus : int, default=0
+        Random seed used for the removal branch.
+
+    seed_plus : int, default=0
+        Random seed used for the addition branch.
+
+    Returns
+    -------
+    g_vqe
+        Combined variational Green's function.
+
+    record_keeping : dict
+        Lanczos coefficients, optimizer information, Green's function,
+        and Qiskit Krylov states.
     """
-    # Same kwarg-sharing pattern as the real calculate_gf_vqe: most
-    # Lanczos keyword arguments are identical between the +/- branches.
+
+    # ========================================================
+    # SHARED LANCZOS SETTINGS
+    # ========================================================
+
     lanczos_iteration_minus_kwargs = {
+        "display": display,
         "Hmat": Hmat,
         "H2mat": H2mat,
         "n_layers": vqe_depth,
@@ -927,7 +1332,9 @@ def calculate_gf_vqe_qiskit(
         "maxiter": maxiters,
         "gf_gtol": gf_gtol,
     }
+
     lanczos_iteration_plus_kwargs = {
+        "display": display,
         "Hmat": Hmat,
         "H2mat": H2mat,
         "n_layers": vqe_depth,
@@ -939,67 +1346,284 @@ def calculate_gf_vqe_qiskit(
         "maxiter": maxiters,
         "gf_gtol": gf_gtol,
     }
+
+
+    # ========================================================
+    # REMOVAL-BRANCH SETTINGS
+    # ========================================================
 
     phi_minus_lanczos_kwargs = dict(
-        {"niter": vqe_krylov_ideal_dim_minus, "u": phi_minus, "charge_sec": vqe_charge_minus,
-         "spin_sec": vqe_spin_minus},
+        {
+            "niter":
+                vqe_krylov_ideal_dim_minus,
+
+            "u":
+                phi_minus,
+
+            "charge_sec":
+                vqe_charge_minus,
+
+            "spin_sec":
+                vqe_spin_minus,
+        },
         **lanczos_iteration_minus_kwargs,
     )
+
+
+    # ========================================================
+    # ADDITION-BRANCH SETTINGS
+    # ========================================================
+
     phi_plus_lanczos_kwargs = dict(
-        {"niter": vqe_krylov_ideal_dim_plus, "u": phi_plus, "charge_sec": vqe_charge_plus,
-         "spin_sec": vqe_spin_plus},
+        {
+            "niter":
+                vqe_krylov_ideal_dim_plus,
+
+            "u":
+                phi_plus,
+
+            "charge_sec":
+                vqe_charge_plus,
+
+            "spin_sec":
+                vqe_spin_plus,
+        },
         **lanczos_iteration_plus_kwargs,
     )
 
-    g_vqe_plus = np.zeros(len(w), dtype=np.complex128)
-    g_vqe_minus = np.zeros(len(w), dtype=np.complex128)
 
-    # Same sign convention as vqe.calculate_gf_vqe: removal branch gets
-    # w=-w, addition branch gets plain w, and the two are COMBINED via
-    # subtraction (g_vqe = g_vqe_plus - g_vqe_minus) -- NOT addition.
-    # This is the exact convention confirmed against vqe.py's source
-    # during the Qiskit/Qulacs spectral-function debugging: negating
-    # w for the minus branch already encodes the sign, so combining via
-    # subtraction here reproduces the same physics vqe.calculate_gf_vqe
-    # produces. Do not also separately negate g_vqe_minus -- that would
-    # double the sign flip.
+    # ========================================================
+    # GREEN'S-FUNCTION ARRAYS
+    # ========================================================
+
+    g_vqe_plus = np.zeros(
+        len(w),
+        dtype=np.complex128,
+    )
+
+    g_vqe_minus = np.zeros(
+        len(w),
+        dtype=np.complex128,
+    )
+
+
+    # ========================================================
+    # REMOVAL BRANCH
+    #
+    # IMPORTANT:
+    #
+    # Give the removal branch its own RNG starting point.
+    #
+    # Any retries that happen during removal may consume more
+    # random numbers, but they can no longer affect the later
+    # addition branch because addition will be reseeded
+    # independently below.
+    # ========================================================
+
+    np.random.seed(
+        seed_minus
+    )
+
     (
-        a_minus_vqe, b_minus_vqe, lanczos_iterations_results_minus,
-        g_vqe_minus, krylov_states_minus,
-    ) = vqe_gf_pm_qiskit(g_vqe_minus, phi_minus_norm, -w, **phi_minus_lanczos_kwargs)
+        a_minus_vqe,
+        b_minus_vqe,
+        lanczos_iterations_results_minus,
+        g_vqe_minus,
+        krylov_states_minus,
+    ) = vqe_gf_pm_qiskit(
+        g_vqe_minus,
+        phi_minus_norm,
+        -w,
+        **phi_minus_lanczos_kwargs,
+    )
+
+
+    # ========================================================
+    # ADDITION BRANCH
+    #
+    # Reset the RNG independently of what happened during
+    # removal.
+    #
+    # Therefore:
+    #
+    # removal retries
+    #       DO NOT
+    # change addition theta_0.
+    # ========================================================
+
+    np.random.seed(
+        seed_plus
+    )
 
     (
-        a_plus_vqe, b_plus_vqe, lanczos_iterations_results_plus,
-        g_vqe_plus, krylov_states_plus,
-    ) = vqe_gf_pm_qiskit(g_vqe_plus, phi_plus_norm, w, **phi_plus_lanczos_kwargs)
+        a_plus_vqe,
+        b_plus_vqe,
+        lanczos_iterations_results_plus,
+        g_vqe_plus,
+        krylov_states_plus,
+    ) = vqe_gf_pm_qiskit(
+        g_vqe_plus,
+        phi_plus_norm,
+        w,
+        **phi_plus_lanczos_kwargs,
+    )
 
-    # Combine the two contributions of the VQE Green's function
-    g_vqe = g_vqe_plus - g_vqe_minus
 
-    ###
+    # ========================================================
+    # COMBINE REMOVAL + ADDITION
+    #
+    # Preserve the validated Qulacs sign convention:
+    #
+    #   removal evaluated at -w
+    #   addition evaluated at +w
+    #
+    # followed by
+    #
+    #   G = G_plus - G_minus
+    #
+    # Do NOT separately negate g_vqe_minus here.
+    # ========================================================
+
+    g_vqe = (
+        g_vqe_plus
+        - g_vqe_minus
+    )
+
+
+    # ========================================================
+    # RECORD KEEPING
+    # ========================================================
+
     record_keeping = {}
-    record_keeping["lanczos_iteration_results_minus_vqe"] = lanczos_iterations_results_minus
-    record_keeping["a_minus_vqe_real"] = [a.real for a in a_minus_vqe]
-    record_keeping["a_minus_vqe_imag"] = [a.imag for a in a_minus_vqe]
-    record_keeping["b_minus_vqe_real"] = [b.real for b in b_minus_vqe]
-    record_keeping["b_minus_vqe_imag"] = [b.imag for b in b_minus_vqe]
-    record_keeping["lanczos_iteration_results_plus_vqe"] = lanczos_iterations_results_plus
-    record_keeping["a_plus_vqe_real"] = [a.real for a in a_plus_vqe]
-    record_keeping["a_plus_vqe_imag"] = [a.imag for a in a_plus_vqe]
-    record_keeping["b_plus_vqe_real"] = [b.real for b in b_plus_vqe]
-    record_keeping["b_plus_vqe_imag"] = [b.imag for b in b_plus_vqe]
-    # Total Green's function record keeping
-    record_keeping["g_vqe_real"] = [g.real for g in g_vqe]
-    record_keeping["g_vqe_imag"] = [g.imag for g in g_vqe]
-    # Extra info the Qiskit backend provides that the Qulacs version
-    # doesn't return (vqe_gf_pm_qiskit also hands back the optimized
-    # Krylov states themselves) -- kept under Qiskit-specific keys so
-    # it doesn't collide with anything dmft.py's shared utilities read.
-    record_keeping["krylov_states_minus_qiskit"] = krylov_states_minus
-    record_keeping["krylov_states_plus_qiskit"] = krylov_states_plus
-    ###
 
-    return g_vqe, record_keeping
+
+    # --------------------------------------------------------
+    # Removal
+    # --------------------------------------------------------
+
+    record_keeping[
+        "lanczos_iteration_results_minus_vqe"
+    ] = lanczos_iterations_results_minus
+
+    record_keeping[
+        "a_minus_vqe_real"
+    ] = [
+        a.real
+        for a in a_minus_vqe
+    ]
+
+    record_keeping[
+        "a_minus_vqe_imag"
+    ] = [
+        a.imag
+        for a in a_minus_vqe
+    ]
+
+    record_keeping[
+        "b_minus_vqe_real"
+    ] = [
+        b.real
+        for b in b_minus_vqe
+    ]
+
+    record_keeping[
+        "b_minus_vqe_imag"
+    ] = [
+        b.imag
+        for b in b_minus_vqe
+    ]
+
+
+    # --------------------------------------------------------
+    # Addition
+    # --------------------------------------------------------
+
+    record_keeping[
+        "lanczos_iteration_results_plus_vqe"
+    ] = lanczos_iterations_results_plus
+
+    record_keeping[
+        "a_plus_vqe_real"
+    ] = [
+        a.real
+        for a in a_plus_vqe
+    ]
+
+    record_keeping[
+        "a_plus_vqe_imag"
+    ] = [
+        a.imag
+        for a in a_plus_vqe
+    ]
+
+    record_keeping[
+        "b_plus_vqe_real"
+    ] = [
+        b.real
+        for b in b_plus_vqe
+    ]
+
+    record_keeping[
+        "b_plus_vqe_imag"
+    ] = [
+        b.imag
+        for b in b_plus_vqe
+    ]
+
+
+    # --------------------------------------------------------
+    # Total Green's function
+    # --------------------------------------------------------
+
+    record_keeping[
+        "g_vqe_real"
+    ] = [
+        g.real
+        for g in g_vqe
+    ]
+
+    record_keeping[
+        "g_vqe_imag"
+    ] = [
+        g.imag
+        for g in g_vqe
+    ]
+
+
+    # --------------------------------------------------------
+    # Qiskit-specific optimized Krylov states
+    # --------------------------------------------------------
+
+    record_keeping[
+        "krylov_states_minus_qiskit"
+    ] = krylov_states_minus
+
+    record_keeping[
+        "krylov_states_plus_qiskit"
+    ] = krylov_states_plus
+
+
+    # --------------------------------------------------------
+    # Record seeds used for reproducibility
+    # --------------------------------------------------------
+
+    record_keeping[
+        "seed_minus_qiskit"
+    ] = seed_minus
+
+    record_keeping[
+        "seed_plus_qiskit"
+    ] = seed_plus
+
+
+    # ========================================================
+    # RETURN
+    # ========================================================
+
+    return (
+        g_vqe,
+        record_keeping,
+    )
 
 
 def ground_state_cost_function_qiskit(
@@ -1011,38 +1635,32 @@ def ground_state_cost_function_qiskit(
     connected_graphs,
     compilation="generic",
 ):
-    """
-    Qiskit equivalent of SymmQulacsVqeEmulator.expectation_value() as
-    used inside solve_ground_state_local(): build the ansatz circuit
-    for the given parameters/sector, and return <psi(theta)|H|psi(theta)>.
-
-    Ordering note: unlike lanczos_cost_function_qiskit (which needs the
-    OpenFermion-ordering conversion because it multiplies against a
-    matrix built by get_sparse_operator), this only needs Hmat itself,
-    which was ALSO built via get_sparse_operator -- so both the
-    statevector and Hmat need to be in the same (OpenFermion) ordering
-    for this dot product to be meaningful. The raw Qiskit statevector is
-    therefore reordered before computing the expectation value, exactly
-    as vqe_gf_pm_qiskit/lanczos_cost_function_qiskit do before any H or
-    H^2 matrix multiplication.
-
-    :return: real-valued energy expectation (float), suitable as a
-        scipy.optimize.minimize cost function.
-    """
-    circuit = all_symmetry_ansatzae_qiskit(
+    state_raw = _simulate_ansatz_state_qiskit(
         theta=params,
         n_qubits=n_qubits,
         n_layers=n_layers,
-        initial_occupations_indices=initial_occupations_indices,
+        initial_occupations_indices=(
+            initial_occupations_indices
+        ),
         connected_graphs=connected_graphs,
         compilation=compilation,
     )
 
-    state_raw = Statevector.from_instruction(circuit).data
-    state_ordered = qulacs_to_python_ordering_qiskit(state_raw, n_qubits)
+    state_ordered = (
+        qulacs_to_python_ordering_qiskit(
+            state_raw,
+            n_qubits,
+        )
+    )
 
-    energy = expectation_value(state_ordered, Hmat)
-    return float(np.real(energy))
+    energy = expectation_value(
+        state_ordered,
+        Hmat,
+    )
+
+    return float(
+        np.real(energy)
+    )
 
 
 def optimize_sector_qiskit(
@@ -1051,166 +1669,211 @@ def optimize_sector_qiskit(
     n_layers,
     connected_graphs,
     initial_occupations_indices,
-    optimizer="COBYLA",
-    gtol=1e-6,
-    maxiter=10000,
+    optimizer="BFGS",
+    gtol=5e-4,
+    maxiter=1_000_000_000,
     compilation="generic",
 ):
-    """
-    Qiskit equivalent of SymmQulacsVqeEmulator.solve_ground_state_local():
-    optimize the ansatz energy for ONE fixed charge/spin sector (i.e.
-    one fixed initial_occupations_indices), starting from a single
-    random theta_0. Mirrors the original's single-attempt behavior
-    (no multi-start here) -- this function is a 1:1 port, not an
-    enhancement.
+    """Optimize one fixed charge/spin sector with the Qiskit ansatz.
 
-    n_params uses the SAME formula as the real solve_ground_state_local:
-        n_edges = sum(len(connected_graphs[k].edges())
-                       for k in ["graph_up", "graph_down", "graph_stitch"])
-        n_params = n_layers * (n_edges + n_qubits)
-
-    NOTE: the original Qulacs solve_ground_state_local passes
-    options={'maxiter': 1e9} -- a Python float. That's a real,
-    independently-confirmed bug against newer scipy (COBYLA's pyprima
-    backend requires a strict int and raises TypeError on a float
-    maxiter/maxfun). Since this is new code, not a port of that exact
-    line, maxmaxiter here is a real int with a sane default (10000)
-    instead of reproducing that bug.
-
-    :return: scipy.optimize.OptimizeResult from the sector's optimization.
+    The parameter count and random initialization match the original
+    SymmQulacsVqeEmulator.solve_ground_state_local() implementation.
+    BFGS uses the original gradient tolerance; Nelder-Mead and COBYLA
+    use the original tolerances.
     """
     n_edges = sum(
-        len(connected_graphs[k].edges()) for k in ["graph_up", "graph_down", "graph_stitch"]
+        connected_graphs[name].number_of_edges()
+        for name in (
+            "graph_up",
+            "graph_down",
+            "graph_stitch",
+        )
     )
+
     n_params = n_layers * (n_edges + n_qubits)
 
-    theta_0 = np.random.uniform(low=0, high=2 * np.pi, size=n_params)
-
-    opt_args = (Hmat, n_qubits, n_layers, initial_occupations_indices, connected_graphs, compilation)
-
-    result = minimize(
-        ground_state_cost_function_qiskit,
-        theta_0,
-        args=opt_args,
-        method=optimizer,
-        tol=gtol,
-        options={"maxiter": int(maxiter)},
+    theta_0 = np.random.uniform(
+        low=0.0,
+        high=2.0 * np.pi,
+        size=n_params,
     )
 
-    return result
+    opt_args = (
+        Hmat,
+        n_qubits,
+        n_layers,
+        initial_occupations_indices,
+        connected_graphs,
+        compilation,
+    )
 
+    method = optimizer.upper()
+
+    if method == "BFGS":
+        result = minimize(
+            ground_state_cost_function_qiskit,
+            theta_0,
+            args=opt_args,
+            method="BFGS",
+            options={
+                "maxiter": int(maxiter),
+                "gtol": gtol,
+            },
+        )
+
+    elif method == "NELDER-MEAD":
+        result = minimize(
+            ground_state_cost_function_qiskit,
+            theta_0,
+            args=opt_args,
+            method="Nelder-Mead",
+            tol=1e-9,
+            bounds=Bounds(
+                lb=np.zeros(n_params),
+                ub=np.full(n_params, 2.0 * np.pi),
+            ),
+            options={
+                "maxiter": int(maxiter),
+            },
+        )
+
+    elif method == "COBYLA":
+        result = minimize(
+            ground_state_cost_function_qiskit,
+            theta_0,
+            args=opt_args,
+            method="COBYLA",
+            tol=1e-4,
+            options={
+                "maxiter": int(maxiter),
+            },
+        )
+
+    else:
+        raise ValueError(
+            "Unsupported ground-state optimizer. "
+            "Use BFGS, Nelder-Mead, or COBYLA."
+        )
+
+    return result
 
 def solve_vqe_qiskit(
     test_model,
     vqe_depth,
-    optimizer,
-    gs_gtol,
+    optimizer="BFGS",
+    gs_gtol=5e-4,
+    maxiter=1_000_000_000,
     checkpoint_file=None,
     results_file=None,
     display=False,
 ):
-    """
-    Qiskit equivalent of vqe.solve_vqe(): search all allowed charge/spin
-    sectors, optimize the ansatz energy in each (via
-    optimize_sector_qiskit), and return the lowest-energy sector's
-    results. Same sector-enumeration logic as
-    anderson_impurity_model.py's symmetric_ansatz_test() -- same two
-    charge-sector loops (particle number <= n_qubits//2, and its
-    particle-hole mirror above that), same up-down-symmetric restriction
-    to S_z <= 0, same equispaced initial_occupations_indices
-    construction (reused directly from get_initial_occupations_indices_qiskit,
-    which already implements this).
+    """Search all allowed charge/spin sectors and return the VQE minimum.
 
-    Graph reconstruction: like solve_ground_state_local, this derives
-    connected_graphs from test_model directly (return_up_and_down_indices()
-    + get_first_imp_orbital_idx()), since only test_model is given here,
-    not an explicit connected_graphs. This is the same derivation
-    confirmed correct/self-consistent during the Qiskit/Qulacs spectral-
-    function validation earlier in this project.
-
-    CHECKPOINTING: checkpoint_file/results_file are accepted for
-    signature compatibility with vqe.solve_vqe(), but are NOT wired to
-    any disk I/O here -- this function always does a full, in-memory
-    sector search. This is a deliberate choice, not an oversight: the
-    pickle-based checkpoint/results caching in the original Qulacs path
-    was the direct cause of a long, hard-to-diagnose bug earlier in this
-    project (stale cached sector results silently loaded instead of
-    being recomputed, for days of debugging). If file-based caching is
-    genuinely needed here later, it should use a simple, inspectable
-    format (e.g. JSON keyed by (spin, charge)) with an explicit,
-    visible "loaded N stale sectors from cache" message -- not silent
-    pickle loading.
-
-    :return: (vqe_gs_energy, vqe_charge, vqe_spin, minimum_angles, record_keeping)
-        -- same shape as vqe.solve_vqe().
+    This is the Qiskit counterpart of vqe.solve_vqe() plus the sector
+    enumeration performed by symmetric_ansatz_test(). File checkpointing
+    is deliberately not used here; every run is explicit and in-memory.
     """
     if checkpoint_file is not None or results_file is not None:
         print(
-            "NOTE: solve_vqe_qiskit() does not implement checkpoint/results "
-            "file caching (see docstring) -- checkpoint_file/results_file "
-            "are accepted but ignored. Running a full in-memory sector search."
+            "NOTE: solve_vqe_qiskit() ignores checkpoint/results files "
+            "and performs a fresh in-memory sector search."
         )
 
-    up_qubit_indices, down_qubit_indices = test_model.return_up_and_down_indices()
-    impurity_orbital_idx = test_model.get_first_imp_orbital_idx()  # [idx], length-1 list
+    up_qubit_indices, down_qubit_indices = (
+        test_model.return_up_and_down_indices()
+    )
+    impurity_orbital_idx = test_model.get_first_imp_orbital_idx()
 
     n_bath_n_imp_tup = (
         len(up_qubit_indices) - len(impurity_orbital_idx),
         len(impurity_orbital_idx),
     )
-    n_site_model_idx = AIMSiteModelsEnum(n_bath_n_imp_tup).create_n_site_model_idx()
+    n_site_model_idx = (
+        AIMSiteModelsEnum(n_bath_n_imp_tup).create_n_site_model_idx()
+    )
     connected_graphs = create_connected_graphs(
-        n_site_model_idx=n_site_model_idx, show_sub_graphs=False, show_full_plot=False,
+        n_site_model_idx=n_site_model_idx,
+        show_sub_graphs=False,
+        show_full_plot=False,
     )
 
     qubit_hamiltonian = test_model.construct_qubit_hamiltonian()
-    # VQE_GS_ENERGY=0.0 here: this is only used to size Hmat via
-    # create_qiskit_hamiltonian_matrix's shift, which doesn't matter for
-    # comparing energies WITHIN this search (every sector is shifted by
-    # the same constant) -- only the resulting minimum_sector/minimum_angles
-    # are used downstream, not this function's absolute energy scale.
-    Hmat, _, n_qubits = create_qiskit_hamiltonian_matrix(qubit_hamiltonian, 0.0)
+    Hmat, _, n_qubits = create_qiskit_hamiltonian_matrix(
+        qubit_hamiltonian,
+        0.0,
+    )
 
     sector_to_energy = {}
     sector_to_result = {}
 
     def _run_sector(n_electrons, z_spin):
+        # The original symmetric search explicitly evaluates S_z <= 0
+        # and uses up/down symmetry for the positive-spin counterparts.
         if z_spin > 0:
-            return  # up-down symmetric case: only search S_z <= 0
+            return
+
         n_up = (n_electrons + z_spin) // 2
         n_down = (n_electrons - z_spin) // 2
-        initial_occupations_indices = get_initial_occupations_indices_qiskit(
-            up_qubit_indices, down_qubit_indices, n_up, n_down,
+
+        initial_occupations_indices = (
+            get_initial_occupations_indices_qiskit(
+                up_qubit_indices,
+                down_qubit_indices,
+                n_up,
+                n_down,
+            )
         )
+
         if display:
-            print(f"Sector: n_electrons={n_electrons}, z_spin={z_spin}, "
-                  f"init_occ={initial_occupations_indices}")
+            print(
+                f"Sector: n_electrons={n_electrons}, "
+                f"z_spin={z_spin}, "
+                f"init_occ={initial_occupations_indices}"
+            )
+
         result = optimize_sector_qiskit(
-            n_qubits=n_qubits, Hmat=Hmat, n_layers=vqe_depth,
+            n_qubits=n_qubits,
+            Hmat=Hmat,
+            n_layers=vqe_depth,
             connected_graphs=connected_graphs,
             initial_occupations_indices=initial_occupations_indices,
-            optimizer=optimizer, gtol=gs_gtol,
+            optimizer=optimizer,
+            gtol=gs_gtol,
+            maxiter=maxiter,
         )
-        sector_to_energy[(z_spin, n_electrons)] = result.fun
-        sector_to_result[(z_spin, n_electrons)] = result
-        if display:
-            print(f"  -> energy = {result.fun:.6f}, success = {result.success}")
 
-    # Charge sector (N) <= n_qubits // 2
+        key = (z_spin, n_electrons)
+        sector_to_energy[key] = float(result.fun)
+        sector_to_result[key] = result
+
+        if display:
+            print(
+                f"  -> energy={result.fun:.12f}, "
+                f"success={result.success}, "
+                f"nfev={getattr(result, 'nfev', 0)}"
+            )
+
+    # Charge N <= n_qubits/2.
     for n_electrons in range(0, n_qubits // 2 + 1):
         for z_spin in range(-n_electrons, n_electrons + 2, 2):
             _run_sector(n_electrons, z_spin)
 
-    # Charge sector (N) > n_qubits // 2 (particle-hole mirror)
+    # Charge N > n_qubits/2, using the particle-hole mirror range.
     for n_electrons in range(n_qubits // 2 + 1, n_qubits + 1):
         n_mirror = n_qubits - n_electrons
         for z_spin in range(-n_mirror, n_mirror + 1, 2):
             _run_sector(n_electrons, z_spin)
 
-    minimum_sector = min(sector_to_energy, key=sector_to_energy.get)
+    if not sector_to_energy:
+        raise RuntimeError("No charge/spin sectors were optimized.")
+
+    minimum_sector = min(
+        sector_to_energy,
+        key=sector_to_energy.get,
+    )
     minimum_result = sector_to_result[minimum_sector]
     minimum_energy = sector_to_energy[minimum_sector]
-    minimum_angles = minimum_result.x
+    minimum_angles = np.asarray(minimum_result.x, dtype=float).copy()
 
     vqe_spin = int(np.round(minimum_sector[0]))
     vqe_charge = int(np.round(minimum_sector[1]))
@@ -1218,13 +1881,20 @@ def solve_vqe_qiskit(
     vqe_nd = (vqe_charge - vqe_spin) // 2
 
     record_keeping = {
-        "local_vqe_success": minimum_result.success,
+        "local_vqe_success": bool(minimum_result.success),
         "local_vqe_nparams": len(minimum_angles),
-        "local_vqe_nfev": minimum_result.nfev,
-        # nit/njev may not exist for derivative-free optimizers like
-        # COBYLA -- default to 0 rather than crash, same reasoning as
-        # the scipy-compatibility patches used elsewhere in this project.
-        "local_vqe_nfev_total": sum(r.nfev for r in sector_to_result.values()),
+        "local_vqe_nfev": int(getattr(minimum_result, "nfev", 0)),
+        "local_vqe_njev": int(getattr(minimum_result, "njev", 0)),
+        "local_vqe_nit": int(getattr(minimum_result, "nit", 0)),
+        "local_vqe_nfev_total": int(
+            sum(getattr(r, "nfev", 0) for r in sector_to_result.values())
+        ),
+        "local_vqe_njev_total": int(
+            sum(getattr(r, "njev", 0) for r in sector_to_result.values())
+        ),
+        "local_vqe_nit_total": int(
+            sum(getattr(r, "nit", 0) for r in sector_to_result.values())
+        ),
         "vqe_gs_energy": minimum_energy,
         "vqe_charge": vqe_charge,
         "vqe_spin": vqe_spin,
@@ -1234,6 +1904,16 @@ def solve_vqe_qiskit(
     }
 
     if display:
-        print(f"Minimum sector (spin, charge) = {minimum_sector}, energy = {minimum_energy:.6f}")
+        print(
+            f"Minimum sector (spin, charge)={minimum_sector}, "
+            f"energy={minimum_energy:.12f}"
+        )
 
-    return minimum_energy, vqe_charge, vqe_spin, minimum_angles, record_keeping
+    return (
+        minimum_energy,
+        vqe_charge,
+        vqe_spin,
+        minimum_angles,
+        record_keeping,
+    )
+

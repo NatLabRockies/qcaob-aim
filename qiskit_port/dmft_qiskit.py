@@ -20,15 +20,10 @@ deliberate, documented differences from the original:
    (binomial coefficients on charge/spin sectors) with no Qulacs
    objects involved.
 
-2. run_aim_qiskit() is a SINGLE-DEPTH run (fixed vqe_depth), not the
-   depth-scaling search loop run_gs_error_experiment() implements
-   (which reruns calculate_gs at increasing VQE depth until a target
-   error is hit). That scaling behavior was intentionally left out of
-   this first version, consistent with the two-phase build plan
-   (ground state first, then Green's function) -- it can be added
-   later as a thin wrapper around run_aim_qiskit() once both phases
-   are working, the same way the original layers it on top of
-   calculate_gs()/calculate_gf().
+2. Both workflows are available: run_aim_qiskit() performs one fixed
+   VQE depth, while run_gs_error_experiment_qiskit() mirrors the original
+   depth-scaling driver and increases the ansatz depth until the requested
+   ground-state overlap error is reached.
 
 Sign convention note: the particle-removal/addition combination logic
 does NOT live here. calculate_green_function_qiskit() calls
@@ -118,10 +113,12 @@ def calculate_ground_state_qiskit(
     up_qubit_indices,
     down_qubit_indices,
     vqe_depth,
-    optimizer,
-    gs_gtol,
+    optimizer="BFGS",
+    gs_gtol=5e-4,
+    maxiter=1_000_000_000,
     display=False,
 ):
+    
     """
     Solve for the Qiskit-side VQE ground state: search all allowed
     charge/spin sectors (solve_vqe_qiskit), then rebuild the winning
@@ -131,13 +128,20 @@ def calculate_ground_state_qiskit(
         state_ordered (OpenFermion ordering, for exact-state
         comparison), angles, charge, spin, n_up, n_down, record.
     """
-    vqe_energy, vqe_charge, vqe_spin, minimum_angles, record_keeping = qv.solve_vqe_qiskit(
+    (
+        vqe_energy,
+        vqe_charge,
+        vqe_spin,
+        minimum_angles,
+        record_keeping,
+    ) = qv.solve_vqe_qiskit(
         test_model=test_model,
         vqe_depth=vqe_depth,
         optimizer=optimizer,
         gs_gtol=gs_gtol,
+        maxiter=maxiter,
         display=display,
-    )
+    )    
 
     vqe_nu = record_keeping["vqe_nu"]
     vqe_nd = record_keeping["vqe_nd"]
@@ -195,6 +199,9 @@ def calculate_green_function_qiskit(
     conv_tol,
     maxiter,
     gf_gtol,
+    display=False,
+    seed_minus=0,
+    seed_plus=0,
 ):
     """
     Build the Qiskit-side Green's function: Hamiltonian matrices ->
@@ -275,6 +282,9 @@ def calculate_green_function_qiskit(
         conv_tol=conv_tol,
         maxiters=maxiter,
         gf_gtol=gf_gtol,
+        display=display,
+        seed_minus=seed_minus,
+        seed_plus=seed_plus,
     )
 
     spectral = -(1.0 / np.pi) * np.imag(g_total)
@@ -402,79 +412,97 @@ def save_results(results, filename):
 
 # ============================================================
 # F. run_aim_qiskit()
-# The main end-to-end driver. Single VQE depth (see module docstring
-# for why this doesn't replicate run_gs_error_experiment()'s
-# depth-scaling search). Mirrors calculate_gs() + calculate_gf()'s
-# actual call sequence, confirmed against dmft.py's source.
+# Fixed-depth end-to-end driver. For original-style automatic depth
+# selection, use run_gs_error_experiment_qiskit() below.
 # ============================================================
 
 def run_aim_qiskit(
     system_size,
     seed=0,
     vqe_depth=1,
-    optimizer="COBYLA",
-    gs_gtol=5e-5,
+    optimizer="BFGS",
+    gs_gtol=5e-4,
     gf_gtol=5e-5,
-    conv_tol=1e-5,
-    maxiter=50000,
+    conv_tol=1e-6,
+    maxiter=1_000_000,
     w=None,
     calculate_exact=True,
     display=True,
     plot=False,
+    optimizer_seed=0,
+    seed_minus=0,
+    seed_plus=0,
 ):
-    """
-    End-to-end Qiskit AIM run: initialize -> exact ground state ->
-    Qiskit VQE ground state -> compare -> exact Green's function ->
-    Qiskit Green's function -> compare -> return everything.
-
-    :param system_size: AIM system size (same convention as dmft.py --
-        n_bath_n_imp = (system_size - 1, 1)).
-    :param w: frequency grid; defaults to the same grid dmft.py uses
-        (linspace(-25, 25, 1000) + 0.1j) if not supplied.
-    :param calculate_exact: if False, skip the exact-diagonalization
-        comparison entirely and only run the Qiskit VQE side (useful
-        for larger systems where exact diagonalization becomes
-        intractable).
-    :return: dict with keys system, ground_state, green_function (each
-        possibly containing an "exact" sub-key), and errors.
-    """
+    """Run one fixed-depth Qiskit AIM calculation end to end."""
     if w is None:
-        w = np.linspace(-25, 25, 1000, dtype=np.complex128) + 1j * 0.1
+        w = np.linspace(
+            -25,
+            25,
+            1000,
+            dtype=np.complex128,
+        ) + 0.1j
 
-    results = {}
-
-    # ---- Initialize ----
     (
-        impurity_orbital, test_model, n_orbitals, up_qubit_indices,
-        down_qubit_indices, connected_graphs, qubit_hamiltonian,
+        impurity_orbital,
+        test_model,
+        n_orbitals,
+        up_qubit_indices,
+        down_qubit_indices,
+        connected_graphs,
+        qubit_hamiltonian,
     ) = initialize_system(system_size, seed)
 
-    results["system"] = {
-        "system_size": system_size, "seed": seed,
-        "impurity_orbital": impurity_orbital, "n_orbitals": n_orbitals,
-        "up_qubit_indices": up_qubit_indices, "down_qubit_indices": down_qubit_indices,
+    results = {
+        "system": {
+            "system_size": system_size,
+            "seed": seed,
+            "impurity_orbital": impurity_orbital,
+            "n_orbitals": n_orbitals,
+            "up_qubit_indices": up_qubit_indices,
+            "down_qubit_indices": down_qubit_indices,
+        }
     }
 
     if display:
-        print(f"System initialized: system_size={system_size}, seed={seed}, "
-              f"impurity_orbital={impurity_orbital}, n_orbitals={n_orbitals}")
+        print(
+            f"System initialized: N={system_size}, seed={seed}, "
+            f"impurity_orbital={impurity_orbital}"
+        )
 
-    # ---- Exact ground state (optional) ----
-    exact_energy = exact_state = exact_charge = exact_spin = None
+    exact_energy = None
+    exact_state = None
+    exact_charge = None
+    exact_spin = None
+    exact_gs_record = None
     degenerate = False
 
     if calculate_exact:
-        exact_energy, exact_state, exact_charge, exact_spin, degenerate, exact_gs_record = (
-            exact.solve_exact_gs(test_model)
-        )
-        if display:
-            print(f"Exact ground state: energy={exact_energy:.6f}, "
-                  f"charge={exact_charge}, spin={exact_spin}, degenerate={degenerate}")
-        if degenerate:
-            print("WARNING: exact ground state is degenerate -- skipping all "
-                  "exact-vs-Qiskit comparisons for this system.")
+        (
+            exact_energy,
+            exact_state,
+            exact_charge,
+            exact_spin,
+            degenerate,
+            exact_gs_record,
+        ) = exact.solve_exact_gs(test_model)
 
-    # ---- Qiskit VQE ground state ----
+        results["exact_ground_state"] = {
+            "energy": exact_energy,
+            "charge": exact_charge,
+            "spin": exact_spin,
+            "degenerate": degenerate,
+            "record": exact_gs_record,
+        }
+
+        if display:
+            print(
+                f"Exact GS: energy={exact_energy:.12f}, "
+                f"charge={exact_charge}, spin={exact_spin}, "
+                f"degenerate={degenerate}"
+            )
+
+    np.random.seed(optimizer_seed)
+
     gs_result = calculate_ground_state_qiskit(
         test_model=test_model,
         qubit_hamiltonian=qubit_hamiltonian,
@@ -484,15 +512,11 @@ def run_aim_qiskit(
         vqe_depth=vqe_depth,
         optimizer=optimizer,
         gs_gtol=gs_gtol,
+        maxiter=maxiter,
         display=display,
     )
     results["ground_state"] = gs_result
 
-    if display:
-        print(f"Qiskit VQE ground state: energy={gs_result['energy']:.6f}, "
-              f"charge={gs_result['charge']}, spin={gs_result['spin']}")
-
-    # ---- Compare ground states (only if exact was computed and non-degenerate) ----
     if calculate_exact and not degenerate:
         gs_compare = compare_ground_states_qiskit(
             exact_energy=exact_energy,
@@ -501,50 +525,42 @@ def run_aim_qiskit(
             qiskit_state_ordered=gs_result["state_ordered"],
         )
         results["ground_state"]["exact"] = {
-            "energy": exact_energy, "charge": exact_charge, "spin": exact_spin,
+            "energy": exact_energy,
+            "charge": exact_charge,
+            "spin": exact_spin,
         }
         results["ground_state"]["comparison"] = gs_compare
-        if display:
-            print(f"Ground-state comparison: rel_error={gs_compare['gs_energy_rel_error']:.3e}, "
-                  f"fidelity={gs_compare['gs_fidelity']:.6f}")
 
-    # ---- Green's functions (only if ground state comparison makes sense) ----
+    qiskit_gf = calculate_green_function_qiskit(
+        impurity_orbital=impurity_orbital,
+        qubit_hamiltonian=qubit_hamiltonian,
+        ground_state_result=gs_result,
+        up_qubit_indices=up_qubit_indices,
+        down_qubit_indices=down_qubit_indices,
+        connected_graphs=connected_graphs,
+        n_orbitals=n_orbitals,
+        vqe_depth=vqe_depth,
+        w=w,
+        optimizer=optimizer,
+        conv_tol=conv_tol,
+        maxiter=maxiter,
+        gf_gtol=gf_gtol,
+        display=display,
+        seed_minus=seed_minus,
+        seed_plus=seed_plus,
+    )
+    results["green_function"] = qiskit_gf
+
+    # Exact GF is comparison-only and must not run when exact was disabled
+    # or the exact ground state is degenerate.
     if calculate_exact and not degenerate:
-        qiskit_gf = calculate_green_function_qiskit(
-            impurity_orbital=impurity_orbital,
-            qubit_hamiltonian=qubit_hamiltonian,
-            ground_state_result=gs_result,
-            up_qubit_indices=up_qubit_indices,
-            down_qubit_indices=down_qubit_indices,
-            connected_graphs=connected_graphs,
-            n_orbitals=n_orbitals,
-            vqe_depth=vqe_depth,
-            w=w,
-            optimizer=optimizer,
-            conv_tol=conv_tol,
-            maxiter=maxiter,
-            gf_gtol=gf_gtol,
-        )
-        results["green_function"] = qiskit_gf
-
-        # Exact Green's function reuses the VQE-derived Krylov
-        # dimensions (confirmed against dmft.py's actual source: the
-        # **record_keeping unpacking into calculate_gf_exact picks up
-        # vqe_krylov_ideal_dim_minus/plus, not exact's own combinatorial
-        # ideal dimension) -- same truncation depth on both sides, for
-        # a fair comparison.
-        #
-        # new_phi_plus/new_phi_minus must be in the SAME (OpenFermion)
-        # ordering as the exact-diagonalization state, since
-        # exact.exact_gf_pm() compares them directly against the
-        # ladder-operator-applied exact state -- reorder the raw
-        # circuit-ordering Krylov arrays before passing them in, same
-        # rule as everywhere else in this project.
         new_phi_plus_ordered = qulacs_to_python_ordering_qiskit(
-            qiskit_gf["phi_plus_array"], gs_result["n_qubits"]
+            qiskit_gf["phi_plus_array"],
+            gs_result["n_qubits"],
         )
         new_phi_minus_ordered = qulacs_to_python_ordering_qiskit(
-            qiskit_gf["phi_minus_array"], gs_result["n_qubits"]
+            qiskit_gf["phi_minus_array"],
+            gs_result["n_qubits"],
         )
 
         g_exact, exact_gf_record = exact.calculate_gf_exact(
@@ -563,18 +579,594 @@ def run_aim_qiskit(
         spectral_exact = -(1.0 / np.pi) * np.imag(g_exact)
 
         results["green_function"]["exact"] = {
-            "g_total": g_exact, "spectral": spectral_exact, "record": exact_gf_record,
+            "g_total": g_exact,
+            "spectral": spectral_exact,
+            "record": exact_gf_record,
         }
 
-        rel_error, rel_error_record = calculate_relative_errors(qiskit_gf["g_total"], g_exact)
+        rel_error, rel_error_record = calculate_relative_errors(
+            qiskit_gf["g_total"],
+            g_exact,
+        )
         results["errors"] = rel_error_record
-        results["errors"]["g_rel_error"] = rel_error
 
         if display:
-            print(f"Green's function relative error (Qiskit vs exact): {rel_error:.3e}")
+            print(
+                "Green's function relative error "
+                f"(Qiskit vs exact): {rel_error:.6e}"
+            )
 
         if plot:
-            plot_green_functions(w, qiskit_gf["g_total"], g_exact, impurity_orbital)
-            plot_spectral_functions(w, qiskit_gf["spectral"], spectral_exact)
+            plot_gfs_qiskit(
+                w=w,
+                g_qiskit=qiskit_gf["g_total"],
+                g_exact=g_exact,
+                impurity_orbital=impurity_orbital,
+                n_layers=vqe_depth,
+                g_rel_error=rel_error,
+            )
+
+    elif calculate_exact and degenerate and display:
+        print(
+            "Exact ground state is degenerate; "
+            "Qiskit GF was computed but exact comparison was skipped."
+        )
 
     return results
+
+def run_gs_error_experiment_qiskit(
+    system_size,
+    target_err,
+    seed=0,
+    gf_maxiter=1_000_000,
+    gs_maxiter=1_000_000_000,
+    gs_gtol=5e-4,
+    gf_gtol=5e-5,
+    pre_empt_layers=4,
+    starting_depth=1,
+    gs=False,
+    display=True,
+    plot=False,
+    optimizer="BFGS",
+    conv_tol=1e-6,
+    w=None,
+    optimizer_seed=0,
+):
+    """
+    Qiskit equivalent of dmft.run_gs_error_experiment().
+
+    Increase VQE depth from starting_depth through pre_empt_layers.
+    Stop when the ground-state overlap error falls below target_err.
+    If that ground-state optimization also reports success and gs=False,
+    calculate the Green's function once at the accepted depth.
+    """
+
+    if starting_depth > pre_empt_layers:
+        raise ValueError(
+            "starting_depth must not be greater than "
+            "pre_empt_layers."
+        )
+
+    if w is None:
+        w = (
+            np.linspace(
+                -25,
+                25,
+                1000,
+                dtype=np.complex128,
+            )
+            + 0.1j
+        )
+
+    (
+        impurity_orbital,
+        test_model,
+        n_orbitals,
+        up_qubit_indices,
+        down_qubit_indices,
+        connected_graphs,
+        qubit_hamiltonian,
+    ) = initialize_system(
+        system_size,
+        seed,
+    )
+
+    (
+        exact_energy,
+        exact_state,
+        exact_charge,
+        exact_spin,
+        degenerate,
+        exact_gs_record,
+    ) = exact.solve_exact_gs(
+        test_model
+    )
+
+    results = {
+        "system": {
+            "system_size": system_size,
+            "seed": seed,
+            "impurity_orbital": impurity_orbital,
+            "n_orbitals": n_orbitals,
+            "up_qubit_indices": up_qubit_indices,
+            "down_qubit_indices": down_qubit_indices,
+        },
+        "exact_ground_state": {
+            "energy": exact_energy,
+            "charge": exact_charge,
+            "spin": exact_spin,
+            "degenerate": degenerate,
+            "record": exact_gs_record,
+        },
+        "depth_history": {},
+        "selected_depth": None,
+        "overall_success": False,
+    }
+
+    if degenerate:
+        if display:
+            print(
+                "Exact ground state is degenerate. "
+                "Depth-scaling run stopped."
+            )
+        return results
+
+    # Deterministic optimization sequence.
+    np.random.seed(
+        optimizer_seed
+    )
+
+    selected_gs = None
+
+    for n_layers in range(
+        starting_depth,
+        pre_empt_layers + 1,
+    ):
+
+        if display:
+            print()
+            print("=" * 72)
+            print(
+                f"N={system_size}, "
+                f"L={n_layers}, "
+                f"GS gtol={gs_gtol:.1e}"
+            )
+            print("=" * 72)
+
+        gs_result = calculate_ground_state_qiskit(
+            test_model=test_model,
+            qubit_hamiltonian=qubit_hamiltonian,
+            connected_graphs=connected_graphs,
+            up_qubit_indices=up_qubit_indices,
+            down_qubit_indices=down_qubit_indices,
+            vqe_depth=n_layers,
+            optimizer=optimizer,
+            gs_gtol=gs_gtol,
+            maxiter=gs_maxiter,
+            display=display,
+        )
+
+        gs_compare = compare_ground_states_qiskit(
+            exact_energy=exact_energy,
+            qiskit_energy=gs_result["energy"],
+            exact_state=exact_state,
+            qiskit_state_ordered=(
+                gs_result["state_ordered"]
+            ),
+        )
+
+        gs_result["exact"] = {
+            "energy": exact_energy,
+            "charge": exact_charge,
+            "spin": exact_spin,
+        }
+
+        gs_result["comparison"] = (
+            gs_compare
+        )
+
+        local_success = bool(
+            gs_result["record"][
+                "local_vqe_success"
+            ]
+        )
+
+        gs_error = float(
+            gs_compare["gs_error"]
+        )
+
+        results["depth_history"][
+            n_layers
+        ] = {
+            "gs_error": gs_error,
+            "gs_energy_rel_error": float(
+                gs_compare[
+                    "gs_energy_rel_error"
+                ]
+            ),
+            "local_vqe_success": (
+                local_success
+            ),
+            "energy": float(
+                gs_result["energy"]
+            ),
+        }
+
+        if display:
+            print(
+                f"L={n_layers}: "
+                f"GS overlap error={gs_error:.6e}, "
+                f"success={local_success}"
+            )
+
+        # Match the original workflow:
+        # stop when the GS error threshold has been reached.
+        if gs_error < target_err:
+
+            results["selected_depth"] = (
+                n_layers
+            )
+
+            selected_gs = gs_result
+
+            results["overall_success"] = (
+                local_success
+            )
+
+            break
+
+    if selected_gs is None:
+
+        if display:
+            print()
+            print(
+                "Ground-state target was not reached "
+                f"through L={pre_empt_layers}."
+            )
+
+        return results
+
+    results["ground_state"] = (
+        selected_gs
+    )
+
+    if not results["overall_success"]:
+
+        if display:
+            print(
+                "Ground-state target was reached, "
+                "but optimizer success=False. "
+                "Green's function will not be run."
+            )
+
+        return results
+
+    if gs:
+        return results
+
+    selected_depth = results[
+        "selected_depth"
+    ]
+
+    if display:
+        print()
+        print("=" * 72)
+        print(
+            f"GROUND STATE ACCEPTED AT L="
+            f"{selected_depth}"
+        )
+        print("Starting Green's function")
+        print("=" * 72)
+
+    qiskit_gf = calculate_green_function_qiskit(
+        impurity_orbital=impurity_orbital,
+        qubit_hamiltonian=qubit_hamiltonian,
+        ground_state_result=selected_gs,
+        up_qubit_indices=up_qubit_indices,
+        down_qubit_indices=down_qubit_indices,
+        connected_graphs=connected_graphs,
+        n_orbitals=n_orbitals,
+        vqe_depth=selected_depth,
+        w=w,
+        optimizer=optimizer,
+        conv_tol=conv_tol,
+        maxiter=gf_maxiter,
+        gf_gtol=gf_gtol,
+        display=display,
+        seed_minus=optimizer_seed,
+        seed_plus=optimizer_seed,
+    )
+
+    results["green_function"] = (
+        qiskit_gf
+    )
+
+    new_phi_plus_ordered = (
+        qulacs_to_python_ordering_qiskit(
+            qiskit_gf[
+                "phi_plus_array"
+            ],
+            selected_gs["n_qubits"],
+        )
+    )
+
+    new_phi_minus_ordered = (
+        qulacs_to_python_ordering_qiskit(
+            qiskit_gf[
+                "phi_minus_array"
+            ],
+            selected_gs["n_qubits"],
+        )
+    )
+
+    (
+        g_exact,
+        exact_gf_record,
+    ) = exact.calculate_gf_exact(
+        exact_gs=exact_state,
+        test_model=test_model,
+        new_phi_plus=(
+            new_phi_plus_ordered
+        ),
+        new_phi_minus=(
+            new_phi_minus_ordered
+        ),
+        n_orbitals=n_orbitals,
+        w=w,
+        exact_gs_energy=exact_energy,
+        gs=False,
+        vqe_krylov_ideal_dim_plus=(
+            qiskit_gf[
+                "krylov_dim_plus"
+            ]
+        ),
+        vqe_krylov_ideal_dim_minus=(
+            qiskit_gf[
+                "krylov_dim_minus"
+            ]
+        ),
+        impurity_orbital=(
+            impurity_orbital
+        ),
+    )
+
+    spectral_exact = (
+        -(1.0 / np.pi)
+        * np.imag(g_exact)
+    )
+
+    results["green_function"][
+        "exact"
+    ] = {
+        "g_total": g_exact,
+        "spectral": spectral_exact,
+        "record": exact_gf_record,
+    }
+
+    (
+        rel_error,
+        rel_error_record,
+    ) = calculate_relative_errors(
+        qiskit_gf["g_total"],
+        g_exact,
+    )
+
+    results["errors"] = (
+        rel_error_record
+    )
+
+    results["errors"][
+        "g_rel_error"
+    ] = rel_error
+
+    if display:
+        print()
+        print(
+            "GF relative error:",
+            rel_error,
+        )
+
+    if plot:
+        plot_gfs_qiskit(
+            w=w,
+            g_qiskit=(
+                qiskit_gf["g_total"]
+            ),
+            g_exact=g_exact,
+            impurity_orbital=(
+                impurity_orbital
+            ),
+            n_layers=(
+                selected_depth
+            ),
+            g_rel_error=(
+                rel_error
+            ),
+        )
+
+    return results
+
+def plot_gfs_qiskit(
+    w,
+    g_qiskit,
+    g_exact,
+    impurity_orbital=None,
+    n_layers=None,
+    g_rel_error=None,
+):
+    omega = np.real(w)
+
+    spectral_qiskit = (
+        -(1.0 / np.pi)
+        * np.imag(g_qiskit)
+    )
+
+    spectral_exact = (
+        -(1.0 / np.pi)
+        * np.imag(g_exact)
+    )
+
+    plt.figure(
+        figsize=(9, 6)
+    )
+
+    plt.plot(
+        omega,
+        np.real(g_qiskit),
+        "b-",
+        label="Qiskit real",
+    )
+
+    plt.plot(
+        omega,
+        spectral_qiskit,
+        "g-",
+        label="Qiskit spectral",
+    )
+
+    plt.plot(
+        omega,
+        np.real(g_exact),
+        "#00b2ee", linestyle='dashed',
+        label="Exact real",
+    )
+
+    plt.plot(
+        omega,
+        spectral_exact,
+        "#66cdaa", linestyle='dashed',
+        label="Exact spectral",
+    )
+
+    plt.xlabel(
+        r"$\omega$"
+    )
+
+    if impurity_orbital is None:
+        plt.ylabel(
+            r"$G^{ret}(\omega)$"
+        )
+    else:
+        plt.ylabel(
+            rf"$G^{{ret}}_{{{impurity_orbital}}}(\omega)$"
+        )
+
+    title_parts = []
+
+    if n_layers is not None:
+        title_parts.append(
+            rf"$n_{{layers}}={n_layers}$"
+        )
+
+    title_parts.append(
+        "BFGS"
+    )
+
+    if g_rel_error is not None:
+        title_parts.append(
+            f"GF rel err={g_rel_error:.3f}"
+        )
+
+    plt.title(
+        ", ".join(title_parts)
+    )
+
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+
+# ============================================================
+# COMMAND-LINE / NOTEBOOK ENTRY POINT
+# Makes dmft_qiskit.py runnable like the original dmft.py
+# ============================================================
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the Qiskit AIM workflow with automatic VQE-depth "
+            "selection, mirroring the original dmft.py driver."
+        )
+    )
+
+    parser.add_argument(
+        "-size", "--system_size", type=int, required=True,
+        help="AIM system size N.",
+    )
+    parser.add_argument(
+        "-s", "--seed", type=int, default=0,
+        help="AIM Hamiltonian seed.",
+    )
+    parser.add_argument(
+        "-t", "--target_error", type=float, required=True,
+        help="Target ground-state overlap error for depth selection.",
+    )
+    parser.add_argument(
+        "-m", "--maxiters", type=int, default=1_000_000,
+        help="Maximum GF optimizer iterations/evaluations.",
+    )
+    parser.add_argument(
+        "-gsm", "--gs_maxiters", type=int, default=1_000_000_000,
+        help="Maximum ground-state optimizer iterations.",
+    )
+    parser.add_argument(
+        "-g", "--gf_gtol", type=float, default=5e-5,
+        help="Green's-function BFGS gradient tolerance.",
+    )
+    parser.add_argument(
+        "-gs_gtol", "--gs_gtol", type=float, default=5e-4,
+        help="Ground-state BFGS gradient tolerance.",
+    )
+    parser.add_argument(
+        "-pel", "--pre_empt_layers", type=int, default=4,
+        help="Maximum ansatz depth to test.",
+    )
+    parser.add_argument(
+        "-svd", "--starting_vqe_depth", type=int, default=1,
+        help="First ansatz depth to test.",
+    )
+    parser.add_argument(
+        "-gs", "--ground_state", action="store_true",
+        help="Stop after ground-state depth selection.",
+    )
+    parser.add_argument(
+        "-d", "--display", action="store_true",
+        help="Display progress.",
+    )
+    parser.add_argument(
+        "-p", "--plot", action="store_true",
+        help="Plot the final Green's function.",
+    )
+
+    args = parser.parse_args()
+
+    if args.starting_vqe_depth > args.pre_empt_layers:
+        raise ValueError(
+            "starting_vqe_depth must not be greater than pre_empt_layers."
+        )
+
+    return run_gs_error_experiment_qiskit(
+        system_size=args.system_size,
+        target_err=args.target_error,
+        seed=args.seed,
+        gf_maxiter=args.maxiters,
+        gs_maxiter=args.gs_maxiters,
+        gs_gtol=args.gs_gtol,
+        gf_gtol=args.gf_gtol,
+        pre_empt_layers=args.pre_empt_layers,
+        starting_depth=args.starting_vqe_depth,
+        gs=args.ground_state,
+        display=args.display,
+        plot=args.plot,
+        optimizer="BFGS",
+        conv_tol=1e-6,
+        optimizer_seed=0,
+    )
+
+
+if __name__ == "__main__":
+    results = main()
