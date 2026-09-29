@@ -24,7 +24,7 @@ from numpy.typing import NDArray
 # QUANTUM BACKEND
 # ============================================================
 
-BACKEND = "qulacs"
+BACKEND = "qiskit"
 # BACKEND = "qulacs"
 
 VALID_BACKENDS = {

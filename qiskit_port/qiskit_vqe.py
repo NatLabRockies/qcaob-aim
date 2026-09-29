@@ -1900,7 +1900,10 @@ def solve_vqe_qiskit(
         "vqe_spin": vqe_spin,
         "vqe_nu": vqe_nu,
         "vqe_nd": vqe_nd,
-        "sector_to_energy": sector_to_energy,
+        "sector_to_energy": {
+            f"spin={int(spin)},charge={int(charge)}": float(energy)
+            for (spin, charge), energy in sector_to_energy.items()
+        },
     }
 
     if display:
