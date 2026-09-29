@@ -3,6 +3,11 @@ from anderson_impurity_model import AndersonImpurityModel
 import exact
 import vqe
 from n_site_graph_creation import AIMSiteModelsEnum, create_connected_graphs
+import qiskit_port.qiskit_vqe as qv
+from qiskit_port.qiskit_utils import (
+    create_qiskit_hamiltonian_matrix,
+    qulacs_to_python_ordering_qiskit,
+)
 import numpy as np
 from openfermion.ops import QubitOperator
 from scipy import sparse
@@ -13,6 +18,26 @@ import argparse
 import time
 import json
 from numpy.typing import NDArray
+
+
+# ============================================================
+# QUANTUM BACKEND
+# ============================================================
+
+BACKEND = "qulacs"
+# BACKEND = "qulacs"
+
+VALID_BACKENDS = {
+    "qiskit",
+    "qulacs",
+}
+
+if BACKEND not in VALID_BACKENDS:
+    raise ValueError(
+        f"BACKEND must be one of {VALID_BACKENDS}; "
+        f"received {BACKEND!r}"
+    )
+
 
 
 def main():
@@ -295,6 +320,113 @@ def run_gs_error_experiment(
     return None
 
 
+
+def _solve_vqe_gs_backend(
+    test_model,
+    qubit_hamiltonian,
+    connected_graphs,
+    up_qubit_indices,
+    down_qubit_indices,
+    vqe_depth,
+    optimizer,
+    gs_gtol,
+    maxiters,
+    display=False,
+    checkpoint_file="",
+    results_file="",
+):
+    """
+    Solve the VQE ground state using the selected backend.
+
+    Returns the same common structure for both backends:
+
+        vqe_gs_energy
+        vqe_gs_ordered
+        backend_state
+        minimum_angles
+        record_keeping
+    """
+
+    if BACKEND == "qulacs":
+
+        return vqe.solve_vqe_gs(
+            test_model=test_model,
+            qubit_hamiltonian=qubit_hamiltonian,
+            connected_graphs=connected_graphs,
+            up_qubit_indices=up_qubit_indices,
+            down_qubit_indices=down_qubit_indices,
+            vqe_depth=vqe_depth,
+            optimizer=optimizer,
+            gs_gtol=gs_gtol,
+            display=display,
+            checkpoint_file=checkpoint_file,
+            results_file=results_file,
+        )
+
+    if BACKEND == "qiskit":
+
+        (
+            vqe_gs_energy,
+            vqe_charge,
+            vqe_spin,
+            minimum_angles,
+            record_keeping,
+        ) = qv.solve_vqe_qiskit(
+            test_model=test_model,
+            vqe_depth=vqe_depth,
+            optimizer=optimizer,
+            gs_gtol=gs_gtol,
+            maxiter=maxiters,
+            display=display,
+        )
+
+        vqe_nu = record_keeping["vqe_nu"]
+        vqe_nd = record_keeping["vqe_nd"]
+
+        (
+            _,
+            _,
+            n_qubits,
+        ) = create_qiskit_hamiltonian_matrix(
+            qubit_hamiltonian,
+            vqe_gs_energy,
+        )
+
+        (
+            qiskit_state,
+            qiskit_state_array,
+        ) = qv.construct_vqe_gs_qiskit(
+            n_qubits=n_qubits,
+            up_qubit_indices=up_qubit_indices,
+            down_qubit_indices=down_qubit_indices,
+            vqe_depth=vqe_depth,
+            connected_graphs=connected_graphs,
+            minimum_angles=minimum_angles,
+            vqe_nu=vqe_nu,
+            vqe_nd=vqe_nd,
+        )
+
+        qiskit_state_ordered = (
+            qulacs_to_python_ordering_qiskit(
+                qiskit_state_array,
+                n_qubits,
+            )
+        )
+
+        return (
+            vqe_gs_energy,
+            qiskit_state_ordered,
+            qiskit_state,
+            minimum_angles,
+            record_keeping,
+        )
+
+    raise ValueError(
+        f"Unsupported backend: {BACKEND!r}"
+    )
+
+
+
 def calculate_gs(
         impurity_orbital: int,
         test_model: AndersonImpurityModel,
@@ -350,8 +482,26 @@ def calculate_gs(
         return record_keeping, _, _
 
     # 1.2 VQE
-    vqe_gs_energy, vqe_gs, _, minimum_angles, \
-        record_vqe_gs = vqe.solve_vqe_gs(test_model, qubit_hamiltonian, connected_graphs, up_qubit_indices, down_qubit_indices, display=display, **record_keeping)
+    (
+        vqe_gs_energy,
+        vqe_gs,
+        _,
+        minimum_angles,
+        record_vqe_gs,
+    ) = _solve_vqe_gs_backend(
+        test_model=test_model,
+        qubit_hamiltonian=qubit_hamiltonian,
+        connected_graphs=connected_graphs,
+        up_qubit_indices=up_qubit_indices,
+        down_qubit_indices=down_qubit_indices,
+        vqe_depth=vqe_depth,
+        optimizer=optimizer,
+        gs_gtol=gs_gtol,
+        maxiters=maxiters,
+        display=display,
+        checkpoint_file=checkpoint_file,
+        results_file=results_file,
+    )
     record_keeping.update(record_vqe_gs)
     ###
 
