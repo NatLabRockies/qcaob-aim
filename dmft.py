@@ -24,7 +24,7 @@ from numpy.typing import NDArray
 # QUANTUM BACKEND
 # ============================================================
 
-BACKEND = "qiskit"
+BACKEND = "qulacs"
 # BACKEND = "qulacs"
 
 VALID_BACKENDS = {
@@ -517,6 +517,230 @@ def calculate_gs(
     return record_keeping, exact_gs, minimum_angles
 
 
+def _calculate_gf_qiskit_backend(
+    impurity_orbital,
+    test_model,
+    n_orbitals,
+    up_qubit_indices,
+    down_qubit_indices,
+    connected_graphs,
+    qubit_hamiltonian,
+    vqe_depth,
+    w,
+    optimizer,
+    gf_gtol,
+    vqe_gs_energy,
+    vqe_spin,
+    vqe_charge,
+    exact_gs,
+    exact_spin,
+    exact_charge,
+    minimum_angles,
+    record_keeping,
+):
+    """
+    Qiskit implementation of the Green's-function backend.
+
+    Returns:
+        g_vqe
+        g_exact
+        updated record_keeping
+    """
+
+    # --------------------------------------------------------
+    # Exact Krylov-dimension bookkeeping
+    # --------------------------------------------------------
+
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        record_exact_krylov_dims,
+    ) = exact.construct_exact_krylov_dimensions(
+        up_qubit_indices,
+        impurity_orbital,
+        n_orbitals,
+        exact_charge,
+        exact_spin,
+    )
+
+    record_keeping.update(
+        record_exact_krylov_dims
+    )
+
+    # --------------------------------------------------------
+    # Qiskit Hamiltonian
+    # --------------------------------------------------------
+
+    Hmat, H2mat, n_qubits = (
+        create_qiskit_hamiltonian_matrix(
+            qubit_hamiltonian,
+            vqe_gs_energy,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Reconstruct selected VQE ground state
+    # --------------------------------------------------------
+
+    qiskit_gs, _ = qv.construct_vqe_gs_qiskit(
+        n_qubits=n_qubits,
+        up_qubit_indices=up_qubit_indices,
+        down_qubit_indices=down_qubit_indices,
+        vqe_depth=vqe_depth,
+        connected_graphs=connected_graphs,
+        minimum_angles=minimum_angles,
+        vqe_nu=record_keeping["vqe_nu"],
+        vqe_nd=record_keeping["vqe_nd"],
+    )
+
+    # --------------------------------------------------------
+    # Variational Krylov sectors/dimensions
+    # --------------------------------------------------------
+
+    (
+        _,
+        _,
+        vqe_charge_minus,
+        vqe_spin_minus,
+        vqe_krylov_ideal_dim_minus,
+        _,
+        _,
+        vqe_charge_plus,
+        vqe_spin_plus,
+        vqe_krylov_ideal_dim_plus,
+        record_vqe_krylov_dims,
+    ) = vqe.construct_vqe_krylov_dimensions(
+        up_idx=up_qubit_indices,
+        impurity_orbital=impurity_orbital,
+        n_orbitals=n_orbitals,
+        vqe_charge=vqe_charge,
+        vqe_spin=vqe_spin,
+    )
+
+    record_keeping.update(
+        record_vqe_krylov_dims
+    )
+
+    # --------------------------------------------------------
+    # Initial Krylov vectors
+    # --------------------------------------------------------
+
+    (
+        _,
+        phi_minus_array,
+        phi_minus_norm,
+        _,
+        phi_plus_array,
+        phi_plus_norm,
+        record_krylov_zero,
+    ) = qv.vqe_krylov_zero_state_qiskit(
+        vqe_gs=qiskit_gs,
+        impurity_orbital=impurity_orbital,
+        n_qubits=n_qubits,
+    )
+
+    record_keeping.update(
+        record_krylov_zero
+    )
+
+    # --------------------------------------------------------
+    # Qiskit variational Green's function
+    # --------------------------------------------------------
+
+    g_vqe, record_vqe_gf = (
+        qv.calculate_gf_vqe_qiskit(
+            Hmat=Hmat,
+            H2mat=H2mat,
+            phi_minus=phi_minus_array,
+            phi_plus=phi_plus_array,
+            vqe_charge_minus=vqe_charge_minus,
+            vqe_charge_plus=vqe_charge_plus,
+            vqe_spin_minus=vqe_spin_minus,
+            vqe_spin_plus=vqe_spin_plus,
+            up_qubit_indices=up_qubit_indices,
+            down_qubit_indices=down_qubit_indices,
+            connected_graphs=connected_graphs,
+            w=w,
+            vqe_krylov_ideal_dim_minus=(
+                vqe_krylov_ideal_dim_minus
+            ),
+            vqe_krylov_ideal_dim_plus=(
+                vqe_krylov_ideal_dim_plus
+            ),
+            phi_minus_norm=phi_minus_norm,
+            phi_plus_norm=phi_plus_norm,
+            vqe_depth=vqe_depth,
+            optimizer=optimizer,
+            conv_tol=record_keeping["conv_tol"],
+            maxiters=record_keeping["maxiters"],
+            gf_gtol=gf_gtol,
+        )
+    )
+
+    record_keeping.update(
+        record_vqe_gf
+    )
+
+    # --------------------------------------------------------
+    # Exact GF requires OpenFermion/Python ordering
+    # --------------------------------------------------------
+
+    new_phi_minus = (
+        qulacs_to_python_ordering_qiskit(
+            phi_minus_array,
+            n_qubits,
+        )
+    )
+
+    new_phi_plus = (
+        qulacs_to_python_ordering_qiskit(
+            phi_plus_array,
+            n_qubits,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Exact Green's function
+    # --------------------------------------------------------
+
+    g_exact, record_exact_gf = (
+        exact.calculate_gf_exact(
+            exact_gs=exact_gs,
+            test_model=test_model,
+            new_phi_plus=new_phi_plus,
+            new_phi_minus=new_phi_minus,
+            n_orbitals=n_orbitals,
+            w=w,
+            exact_gs_energy=(
+                record_keeping["exact_gs_energy"]
+            ),
+            gs=False,
+            vqe_krylov_ideal_dim_plus=(
+                vqe_krylov_ideal_dim_plus
+            ),
+            vqe_krylov_ideal_dim_minus=(
+                vqe_krylov_ideal_dim_minus
+            ),
+            impurity_orbital=impurity_orbital,
+        )
+    )
+
+    record_keeping.update(
+        record_exact_gf
+    )
+
+    return (
+        g_vqe,
+        g_exact,
+        record_keeping,
+    )
+
+
+    
 def calculate_gf(
     impurity_orbital: int,
     test_model: AndersonImpurityModel,
