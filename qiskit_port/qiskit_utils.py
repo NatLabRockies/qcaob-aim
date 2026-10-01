@@ -3,15 +3,10 @@ Qiskit-side shared low-level helpers.
 
 Base layer of the qiskit_port package -- these functions have no
 dependency on the ansatz circuit, the optimizer, or any Green's-function
-workflow. They are imported by qiskit_ansatz.py, qiskit_vqe.py, and
-dmft_qiskit.py, and never import any of those files themselves (see the
-project's dependency-direction rule: lower layers never import higher
-ones).
-
-Each function below is a direct, verified extraction from the original
-qiskit_vqe.py -- same implementation, same behavior, just relocated so
-it can be shared without pulling in the optimizer/Lanczos machinery
-that used to live in the same file.
+workflow. They are imported by qiskit_ansatz.py, qiskit_vqe.py, and the
+shared dmft.py workflow, and never import those higher-level modules
+themselves (see the project's dependency-direction rule: lower layers
+never import higher ones).
 """
 from functools import lru_cache
 

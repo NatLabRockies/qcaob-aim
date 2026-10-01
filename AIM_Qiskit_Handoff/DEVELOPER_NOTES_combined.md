@@ -7,7 +7,7 @@ The purpose of this file is different from `START_HERE.md`:
 - `START_HERE.md` explains how the code works and how to get started.
 - **This file records how the code got to its current state, what broke along the way, how each problem was isolated, what tests were run, what fixes were made, and what numerical values should still be reproducible.**
 
-This history covers the project from the initial codebase study in **May 2026** through the final Qiskit/Qulacs validation and handoff work in **September 2026**.
+This history covers the project from the initial codebase study in **May 2026** through the final Qiskit/Qulacs validation, shared-backend merge, and handoff work completed at the end of **September / beginning of October 2026**.
 
 The record below is as complete as the preserved project conversations, files, notebooks, and validation outputs allow. Some early experiments were exploratory and used temporary settings; those are labeled as such so that they are not mistaken for final regression targets.
 
@@ -53,49 +53,90 @@ The final implementation contains explicit protections or documented conventions
 
 # 2. Final source-code architecture
 
-The Qiskit port was intentionally separated into layers:
+The final architecture no longer uses a separate high-level Qiskit driver.
+
+The validated workflow is now:
 
 ```text
-dmft_qiskit.py
-      |
-      v
-qiskit_vqe.py
-      |
-      v
-qiskit_utils.py
-      |
-      +--> qiskit_ansatz.py
+                         dmft.py
+                            |
+                    BACKEND selector
+                     /            \
+               "qulacs"          "qiskit"
+                   |                |
+                 vqe.py       qiskit_port/
+                                   |
+                            qiskit_vqe.py
+                                   |
+                            qiskit_ansatz.py
+                                   |
+                            qiskit_utils.py
 ```
 
-The architecture rule established during the port was:
+The central architectural rule is:
+
+> **There is one high-level AIM/DMFT workflow. Only backend-specific numerical operations are dispatched.**
+
+The current responsibilities are:
 
 ```text
-qiskit_utils.py
-    -> low-level numerical helpers
+dmft.py
+    -> system initialization
+    -> exact-reference orchestration
+    -> ground-state comparison
+    -> automatic ansatz-depth search
+    -> Green's-function workflow
+    -> plotting / result saving
+    -> backend selection
 
-qiskit_ansatz.py
-    -> circuit construction
+vqe.py
+    -> Qulacs-specific VQE and variational-Lanczos operations
+    -> selected backend-independent combinatorial helpers
 
-qiskit_vqe.py
-    -> VQE, Krylov, Lanczos, Green's-function backend
+qiskit_port/qiskit_vqe.py
+    -> Qiskit-specific VQE and variational-Lanczos operations
 
-dmft_qiskit.py
-    -> workflow/orchestration
+qiskit_port/qiskit_ansatz.py
+    -> Qiskit circuit construction
 
-aim_tutorial_qiskit.ipynb
-    -> user-facing tutorial
+qiskit_port/qiskit_utils.py
+    -> low-level Qiskit/NumPy helpers
+    -> state-order conversion
+    -> matrix construction
+    -> continued fractions
 ```
 
-Lower layers should not import higher layers.
+The backend is selected in `dmft.py` with:
 
-The original project is still used for backend-independent functionality:
+```python
+BACKEND = "qiskit"
+```
 
-- `dmft.py` supplies system initialization and the original Qulacs reference workflow.
+or:
+
+```python
+BACKEND = "qulacs"
+```
+
+The former high-level file:
+
+```text
+qiskit_port/dmft_qiskit.py
+```
+
+was used during development and validation, but became redundant once `calculate_gs()`, `calculate_gf()`, and `run_gs_error_experiment()` in `dmft.py` were validated for both backends. It was removed after regression testing.
+
+Historical references to `dmft_qiskit.py` later in this document are intentionally preserved because they describe how the port was developed. They are **not current usage instructions**.
+
+Lower layers should still not import higher workflow layers.
+
+Backend-independent original code continues to be reused where appropriate:
+
 - `exact.py` supplies exact diagonalization and exact Green's-function calculations.
-- selected purely combinatorial helpers from `vqe.py` remain reusable.
 - `n_site_graph_creation.py` remains the graph/connectivity source.
+- selected purely combinatorial helpers from `vqe.py` are shared where doing so does not introduce backend coupling.
 
-This was a deliberate decision. The Qiskit port should replace backend-specific circuit/state operations, not duplicate working physics code without a reason.
+The final merge avoided duplicating the high-level physics workflow while preserving already-validated backend-specific numerical routines.
 
 ---
 
@@ -624,7 +665,7 @@ vqe_gf()
 
 As the Qiskit implementation grew, putting every helper into one file became difficult to reason about.
 
-The code was reorganized into the final layered structure:
+The code was reorganized into an **intermediate Qiskit-specific layered structure**:
 
 ```text
 qiskit_utils.py
@@ -634,6 +675,8 @@ qiskit_utils.py
     -> notebook
 ```
 
+At that stage, `dmft_qiskit.py` was still the separate Qiskit orchestration layer.
+
 The design requirements were:
 
 1. low-level helpers should have one implementation,
@@ -641,7 +684,9 @@ The design requirements were:
 3. exact/backend-independent original code should be reused rather than duplicated,
 4. notebook code should not contain hidden algorithmic sign/order fixes that belong in the backend.
 
-This refactor later made it much easier to isolate errors because each test could target one layer.
+This refactor made it much easier to isolate errors because each test could target one layer.
+
+Later, after the Qiskit path was fully validated, the high-level duplication was removed: orchestration moved back into the shared `dmft.py` workflow behind the `BACKEND` selector. The lower Qiskit layers created during this July refactor remain part of the final design.
 
 ---
 
@@ -1603,27 +1648,22 @@ That remaining difference is a performance limitation, not a known correctness f
 
 # 35. Intermediate source-structure errors
 
-During final refactoring, two code-structure problems appeared in intermediate files:
+During refactoring, two code-structure problems appeared in intermediate files:
 
-1. an indentation problem inside `run_aim_qiskit()`,
+1. an indentation problem inside the then-current `run_aim_qiskit()`,
 2. `_run_sector()` accidentally slipping outside the intended scope of `solve_vqe_qiskit()`.
 
 These were ordinary source-merging/refactoring mistakes, not algorithmic discoveries.
 
-### Fix
+### Fix at that stage
 
-The final files were syntax-checked with:
+The intermediate files were syntax-checked before numerical optimization.
 
-```bash
-python -m py_compile \
-    qiskit_port/qiskit_utils.py \
-    qiskit_port/qiskit_vqe.py \
-    qiskit_port/dmft_qiskit.py
-```
+The important rule that survived the later architecture merge is:
 
-### Rule
+> After manual copying, moving functions, or refactoring imports, run syntax/import checks **before** launching a numerical optimization.
 
-After manual copying or refactoring, run syntax checks **before** launching a numerical optimization.
+The old `dmft_qiskit.py` path mentioned in preserved development notes is historical. The current syntax-check command is recorded in the regression sequence near the end of this document.
 
 ---
 
@@ -1818,13 +1858,27 @@ This is consistent with the earlier direct-fit finding that ansatz depth can be 
 
 The original Qulacs high-level workflow increases depth until the requested ground-state overlap-error target is satisfied.
 
-The Qiskit port now reproduces this behavior with:
+During the port, Qiskit first reproduced this behavior in a separate Qiskit-specific driver.
+
+The final merged implementation now uses the **same** function for both backends:
 
 ```python
-run_gs_error_experiment_qiskit(...)
+dmft.run_gs_error_experiment(...)
 ```
 
-The acceptance quantity is:
+with either:
+
+```python
+dmft.BACKEND = "qiskit"
+```
+
+or:
+
+```python
+dmft.BACKEND = "qulacs"
+```
+
+The acceptance quantity remains:
 
 $$
 \mathrm{gs\_overlap}
@@ -1849,9 +1903,13 @@ $$
 
 Do not confuse this amplitude-overlap error with squared fidelity.
 
+If `gs=False` and the accepted ground state also reports optimizer success, the same shared experiment driver proceeds into `calculate_gf()` and dispatches the Green's-function/Lanczos work to the selected backend.
+
 ---
 
 # 44. Final automatic-depth regression target
+
+This section preserves the **pre-merge independent Qiskit depth-search reference** that was used before the shared `dmft.py` driver became the canonical interface.
 
 For:
 
@@ -1865,7 +1923,7 @@ starting_depth = 1
 pre_empt_layers = 4
 ```
 
-the final Qiskit results were:
+the earlier independent Qiskit results were:
 
 | Depth | VQE ground-state energy | GS overlap error | Optimizer success | Target met? |
 |---:|---:|---:|:---:|:---:|
@@ -1874,7 +1932,7 @@ the final Qiskit results were:
 | 3 | -6.340721627947 | 1.2593785e-04 | True | No |
 | 4 | -6.342237407455 | 1.7446567e-05 | True | Yes |
 
-Expected final selection:
+Expected selection:
 
 ```text
 selected_depth = 4
@@ -1887,49 +1945,57 @@ Exact reference:
 E_exact = -6.34249498827641
 ```
 
-### Important interpretation
+These values remain useful historical regression evidence, but the **current shared-driver regression values are recorded in Section 66** because small optimizer-path differences appeared after the workflow was unified.
 
 `pre_empt_layers=4` means:
 
 > stop searching after layer 4.
 
-It does **not** mean:
-
-> layer 4 is hard-coded as the correct physical answer.
-
-For another system, seed, ansatz, or target, the accepted depth may differ.
+It does **not** mean layer 4 is hard-coded as the correct physical answer.
 
 ---
 
 # 45. Ground-state smoke-test target
 
-The final handoff includes a fast ground-state-only smoke test.
+The current handoff smoke test exercises the Qiskit backend **through the shared `dmft.py` interface**.
 
-It intentionally uses a loose acceptance target so it can stop at `L=1`.
+Run:
 
-Representative expectation:
-
-```text
-system_size       = 4
-seed              = 0
-selected_depth    = 1
-VQE energy        ~= -6.24852694
-GS overlap error  ~= 2.1453e-02
-overall_success   = True
+```bash
+python3 -m pipenv run python qiskit_port/smoke_test_qiskit.py
 ```
 
-This is a **software/environment regression test**, not a claim that `L=1` is production-accurate.
+The smoke test explicitly sets:
 
-The purpose is to verify:
+```python
+dmft.BACKEND = "qiskit"
+```
+
+and uses the small `N=2`, `seed=0`, depth-1 ground-state case.
+
+Current validated expectation:
+
+```text
+backend          = qiskit
+system_size      = 2
+seed             = 0
+VQE energy       = -5.0639591821482135
+GS overlap error ~= 5.64738e-05
+optimizer success= True
+```
+
+This is a **software/environment regression test**, not a production-accuracy benchmark.
+
+Its purpose is to verify:
 
 ```text
 imports
+shared backend dispatch
 system initialization
 exact solver
 Qiskit VQE
 state ordering
-comparison logic
-result dictionary
+ground-state comparison
 ```
 
 without paying for a full Green's-function run.
@@ -1938,41 +2004,41 @@ without paying for a full Green's-function run.
 
 # 46. Qulacs and Qiskit high-level API mismatch discovered during handoff
 
-The original Qulacs function:
+This was a handoff issue in the **pre-merge** architecture.
+
+Historically:
 
 ```python
 dmft.run_gs_error_experiment(...)
 ```
 
-returns:
+on the Qulacs side returned:
 
 ```text
 None
 ```
 
-even though it calculates and plots `g_vqe` internally.
+while the temporary separate Qiskit high-level workflow returned a results dictionary.
 
-The Qiskit high-level workflow returns a results dictionary.
+That difference complicated side-by-side notebook code.
 
-This created confusion when writing side-by-side comparison notebook cells.
+### Resolution
 
-A line such as:
+The separate Qiskit high-level driver was retired.
+
+The current canonical high-level interface is:
 
 ```python
-results_qulacs = dmft.run_gs_error_experiment(...)
+dmft.run_gs_error_experiment(...)
 ```
 
-does **not** produce a Qulacs results dictionary.
+for **both** backends.
 
-### Practical consequence
+Therefore the shared experiment driver now has one return behavior regardless of backend: callers should not assume it returns a backend-specific result dictionary.
 
-For Qulacs data comparisons, use one of these approaches:
+For direct array-level comparisons, use lower-level functions or capture the arrays passed to `plot_gfs()`.
 
-1. call lower-level functions that expose the arrays,
-2. modify the Qulacs function to return data,
-3. or intercept/capture the arrays passed into `plot_gfs()`.
-
-Do not assume the two high-level APIs return the same object shape.
+This is the approach used in the merged tutorial's fixed-depth Qiskit/Qulacs comparison.
 
 ---
 
@@ -2145,21 +2211,22 @@ For a migration handoff, structural similarity is a feature. A cleaner redesign 
 
 # 51. Checkpointing/persistence difference
 
-The original Qulacs workflow includes result/checkpoint file behavior.
+The original Qulacs implementation contains optimizer checkpoint/result-pickle behavior.
 
-The Qiskit port did not fully reproduce every persistence path during the first validated implementation.
+During the separate Qiskit-driver phase, persistence parity was incomplete.
 
-The handoff intentionally prioritizes:
+After the high-level merge, experiment-level result saving again flows through the shared `dmft.py` workflow for both backends.
 
-```text
-correct end-to-end calculation
-reproducible numerical validation
-clear returned result dictionaries
-```
+However, one distinction remains:
 
-over designing a new storage format prematurely.
+- the Qulacs sector solver retains its original checkpoint/pickle behavior,
+- the Qiskit sector solver performs its sector search in memory and does not currently restore the original Qulacs optimizer checkpoint state.
 
-Any future result-persistence implementation should be added only after preserving the regression tests in this file.
+Therefore:
+
+> Shared experiment orchestration/result saving is present, but optimizer-checkpoint parity inside the two backend solvers is not complete.
+
+Any future persistence work should preserve the numerical regression tests before changing file formats or restart behavior.
 
 ---
 
@@ -2371,34 +2438,42 @@ Run tests from cheapest to most expensive.
 ## Stage 1 — syntax/import
 
 ```bash
-python -m py_compile \
+python3 -m pipenv run python -m py_compile \
+    dmft.py \
     qiskit_port/qiskit_utils.py \
+    qiskit_port/qiskit_ansatz.py \
     qiskit_port/qiskit_vqe.py \
-    qiskit_port/dmft_qiskit.py
+    qiskit_port/smoke_test_qiskit.py
 ```
 
-Then verify imports.
-
----
-
-## Stage 2 — smoke test
+Then verify:
 
 ```bash
-python smoke_test_qiskit.py
-```
-
-Expected approximate result:
-
-```text
-selected_depth = 1
-overall_success = True
-VQE energy ~= -6.24852694
-GS error ~= 2.1453e-02
+python3 -m pipenv run python -c "import dmft, qiskit_port; print('imports: OK')"
 ```
 
 ---
 
-## Stage 3 — automatic ground-state depth search
+## Stage 2 — shared Qiskit smoke test
+
+```bash
+python3 -m pipenv run python qiskit_port/smoke_test_qiskit.py
+```
+
+Expected approximately:
+
+```text
+backend          = qiskit
+system_size      = 2
+VQE energy       = -5.0639591821482135
+GS overlap error ~= 5.64738e-05
+optimizer success= True
+PASSED
+```
+
+---
+
+## Stage 3 — shared automatic ground-state depth search
 
 Use:
 
@@ -2409,13 +2484,16 @@ target_err=1e-4
 BFGS
 starting_depth=1
 pre_empt_layers=4
+BACKEND="qiskit"
 ```
 
 Expected:
 
 ```text
-selected_depth = 4
+depth 4 satisfies the target
 ```
+
+The current shared-driver numerical table is recorded in Section 66.
 
 ---
 
@@ -2475,13 +2553,33 @@ Expected Qiskit/Qulacs spectral difference:
 approximately floating-point scale
 ```
 
-with the known controlled `L=4` reference values above.
+with the controlled reference values recorded earlier.
 
 ---
 
-## Stage 9 — independent production workflow
+## Stage 9 — shared full-workflow integration test
 
-Only after the controlled tests pass should independent optimizer differences be investigated.
+Run the small `N=2`, `seed=0`, `target_err=1e-4`, `gs=False` case once with:
+
+```python
+dmft.BACKEND = "qiskit"
+```
+
+and once with:
+
+```python
+dmft.BACKEND = "qulacs"
+```
+
+Both must complete ground-state selection, Green's-function calculation, exact comparison, and result saving without a separate high-level driver.
+
+The validated values are recorded in Section 66.
+
+---
+
+## Stage 10 — independent production workflow
+
+Only after the controlled and shared-integration tests pass should independent optimizer differences be investigated.
 
 ---
 
@@ -2521,27 +2619,33 @@ A one-layer optimizer cannot be expected to reproduce a state that lies outside 
 
 ## 61.5 Persistence/checkpoint parity
 
-The scientific computation is the main validated target. File/checkpoint persistence is not as fully standardized in the Qiskit port as the numerical workflow.
+Shared experiment-level result saving now goes through `dmft.py` for both backends.
+
+The remaining difference is optimizer-checkpoint parity: the Qiskit sector solver does not currently restore the original Qulacs optimizer checkpoint pickle state.
 
 ---
 
 # 62. Recommended future work
 
+The highest-priority architectural merge is complete.
+
 The safest next development work is:
 
-1. preserve the current regression targets,
-2. archive independent production `N=4` results with seeds/settings,
-3. add a canonical environment file or version lock,
-4. standardize result persistence,
-5. add automated unit tests for:
+1. preserve the current shared-driver regression targets,
+2. make backend selection a cleaner user-facing runtime/CLI argument instead of requiring a source edit if desired,
+3. add automated tests for both `BACKEND="qiskit"` and `BACKEND="qulacs"`,
+4. add automated unit tests for:
    - state ordering,
    - phi construction,
    - fixed-$\theta$ cost equality,
    - sign convention,
    - continued fraction,
-6. add an automated controlled Qiskit/Qulacs regression harness,
-7. profile larger systems only after exact-reference scaling is separated from Qiskit runtime,
-8. experiment with deeper ansatzes only while preserving the fixed-parameter backend tests.
+5. add a canonical environment/version lock,
+6. standardize optimizer checkpoint/restart behavior if restart parity is required,
+7. archive independent production `N=4` results with seeds/settings,
+8. profile larger systems only after exact-reference scaling is separated from backend runtime,
+9. experiment with deeper ansatzes only while preserving the fixed-parameter backend tests,
+10. keep the retired high-level Qiskit workflow out of the dependency graph unless there is a specific compatibility reason to restore it.
 
 ---
 
@@ -2561,21 +2665,25 @@ Before merging a change, verify that none of the following happened:
 [ ] abs()/clipping was inserted into b_squared
 [ ] BFGS-only options were passed to another optimizer
 [ ] generic g_vqe notebook variables were overwritten between backends
-[ ] Qulacs run_gs_error_experiment() was assumed to return a dict
+[ ] dmft.run_gs_error_experiment() was assumed to return a result dict
 [ ] a fixed-depth plot was compared with a different-depth reference
 [ ] top-N numerical local maxima were called "the noticeable peaks" without prominence/inspection
-[ ] a source refactor was run without py_compile
+[ ] a source refactor was run without py_compile/import checks
 [ ] a classical-Lanczos or matrix-inverse result was described as variational Lanczos
+[ ] high-level Qiskit workflow logic was duplicated outside dmft.py again
+[ ] the retired separate Qiskit driver was reintroduced as a required dependency
+[ ] only one backend was regression-tested after editing shared dmft.py logic
 ```
 
 ---
 
 # 64. Key numerical regression table
 
+The controlled same-parameter validation values remain the strongest backend-equivalence evidence.
+
 | Check | Expected result |
 |---|---|
 | `N=4`, exact GS energy | `-6.34249498827641` |
-| Automatic depth target `1e-4` | first accepted depth `L=4` |
 | Controlled L4 backend energy difference | `~9.77e-15` |
 | Controlled L4 Qiskit/Qulacs fidelity | `0.9999999999999829` |
 | Controlled $\phi^-$ fidelity | `1.0` |
@@ -2585,13 +2693,40 @@ Before merging a change, verify that none of the following happened:
 | Addition max `|Delta a|` | `~1.24e-14` |
 | Addition max `|Delta b|` | `~5.37e-14` |
 | Controlled L4 GF error vs exact | `~0.0945669` |
-| Max Qiskit/Qulacs spectral difference | `~7e-14` |
+| Max controlled Qiskit/Qulacs spectral difference | `~7e-14` |
 | Controlled variational main peak | `omega ~ 5.33033`, `A ~ 1.4122641` |
 | Exact main peak | `omega ~ 5.28028`, `A ~ 1.49584` |
 | Original Qiskit full cost | `~2.872 ms` |
 | Qulacs full cost | `~0.172 ms` |
 | Cached/Aer Qiskit full cost | `~1.15--1.23 ms` |
 | Same-start BFGS workload | `nit=57`, `nfev=2135` for both |
+
+Current merged-interface regression values:
+
+| Check | Qiskit | Qulacs |
+|---|---:|---:|
+| Shared `N=2`, depth-1 VQE energy | `-5.0639591821482135` | `-5.063959182148379` |
+| Shared `N=2` GS error | `5.64737793247e-05` | `5.64738033157e-05` |
+| Shared `N=2` $\phi^-$ norm | `0.1482505512421816` | `0.14825056999428926` |
+| Shared `N=2` $\phi^+$ norm | `0.9889498339432535` | `0.9889498311321803` |
+| Shared full-workflow GF relative error | `0.013431336315818446` | `0.013431336605184538` |
+
+The shared-driver `N=4`, `seed=0`, `target_err=1e-4` Qiskit depth search produced:
+
+| Depth | VQE energy | GS overlap error |
+|---:|---:|---:|
+| 1 | `-6.248526934441193` | `2.1452864720807874e-02` |
+| 2 | `-6.340253424481447` | `2.1147589396175448e-04` |
+| 3 | `-6.34032358168573` | `1.6311855503836625e-04` |
+| 4 | `-6.342332350365617` | `1.0049509723386585e-05` |
+
+The first accepted depth remains:
+
+```text
+L = 4
+```
+
+Small differences between the pre-merge and merged independent depth-search tables are optimizer-path differences, not evidence of a backend mathematics mismatch. The controlled same-$\theta$ tests above remain the correct reference for backend equivalence.
 
 ---
 
@@ -2601,7 +2736,9 @@ The most important thing for the next developer to understand is that this proje
 
 > "Qiskit produced a plot that looked approximately like Qulacs."
 
-It ended with a much stronger result:
+It ended with two stronger results.
+
+First, controlled same-parameter validation established:
 
 ```text
 same physical model
@@ -2617,6 +2754,18 @@ same spectrum
 
 to numerical precision.
 
+Second, the high-level software architecture was unified so that both backends now run through:
+
+```text
+dmft.py
+    |
+BACKEND selector
+ /             \
+Qulacs        Qiskit
+```
+
+The separate high-level Qiskit driver is no longer required.
+
 The remaining differences in independent runs are therefore interpreted through:
 
 ```text
@@ -2628,4 +2777,277 @@ runtime
 
 before assuming the backend mathematics is wrong.
 
-That distinction was the central lesson of the May--September debugging effort.
+That distinction was the central lesson of the May--September debugging effort, and the shared-backend merge at the end of September / beginning of October converted that numerical validation into a cleaner maintainable architecture.
+
+---
+
+# 66. September 30 / October 1 2026 — shared-backend merge milestone
+
+## 66.1 Refactor goal
+
+The final refactor removed duplicated high-level workflows.
+
+Before:
+
+```text
+dmft.py
+    -> Qulacs workflow
+
+qiskit_port/dmft_qiskit.py
+    -> separate Qiskit workflow
+```
+
+After:
+
+```text
+                         dmft.py
+                            |
+                    BACKEND selector
+                     /            \
+                "qulacs"         "qiskit"
+                    |               |
+                  vqe.py      qiskit_port/
+                                  |
+                           qiskit_vqe.py
+```
+
+The strategy was intentionally conservative:
+
+1. keep the already-validated backend-specific numerical routines intact,
+2. add narrow dispatch points inside the shared workflow,
+3. validate ground-state behavior first,
+4. validate automatic depth search,
+5. validate Green's-function/Lanczos behavior,
+6. validate the entire high-level experiment driver,
+7. only then remove the duplicated Qiskit high-level driver.
+
+## 66.2 Shared ground-state dispatcher
+
+`calculate_gs()` was modified so backend-specific ground-state work is selected internally.
+
+The small `N=2`, depth-1 test passed for both backends.
+
+Qiskit:
+
+```text
+VQE energy = -5.0639591821482135
+exact      = -5.065838993118949
+overlap    = 0.999943526220675
+GS error   = 5.647377932505e-05
+nparams    = 8
+sector     = charge=2, spin=0
+success    = True
+```
+
+Qulacs:
+
+```text
+VQE energy = -5.063959182148379
+exact      = -5.065838993118955
+overlap    = 0.999943526196684
+GS error   = 5.647380331641e-05
+nparams    = 8
+sector     = charge=2, spin=0
+success    = True
+```
+
+Ground-state energy difference:
+
+```text
+~1.7e-13
+```
+
+## 66.3 Shared Qiskit automatic depth search
+
+The shared `run_gs_error_experiment()` driver was tested with:
+
+```text
+N=4
+seed=0
+target_err=1e-4
+BFGS
+gs_gtol=5e-4
+starting_depth=1
+pre_empt_layers=4
+BACKEND="qiskit"
+```
+
+Observed:
+
+```text
+L1:
+    E = -6.248526934441193
+    GS error = 2.1452864720807874e-02
+
+L2:
+    E = -6.340253424481447
+    GS error = 2.1147589396175448e-04
+
+L3:
+    E = -6.34032358168573
+    GS error = 1.6311855503836625e-04
+
+L4:
+    E = -6.342332350365617
+    GS error = 1.0049509723386585e-05
+```
+
+The shared driver correctly stopped at `L=4`.
+
+A JSON serialization problem was found because the Qiskit record contained tuple keys in `sector_to_energy`.
+
+The narrow fix was to retain tuple keys internally and convert only the serialized record copy to string keys such as:
+
+```text
+spin=0,charge=2
+```
+
+## 66.4 Shared Green's-function dispatch
+
+A Qiskit branch was added to the existing `calculate_gf()` interface while leaving the original Qulacs path intact.
+
+The state-order boundary remained critical:
+
+> Raw Qiskit states stay in circuit ordering inside the variational workflow. Reordering occurs only at the OpenFermion/exact-matrix boundary.
+
+## 66.5 Direct shared `calculate_gf()` Qiskit integration result
+
+For the small `N=2`, depth-1 test:
+
+```text
+Qiskit phi- norm = 0.1482505512421816
+Qiskit phi+ norm = 0.9889498339432535
+GF relative error ~= 0.0134322542
+```
+
+Representative coefficients:
+
+```text
+a_minus =
+[2.529902321621563,
+ 7.765543765511341,
+ 2.529900311835414]
+
+b_minus =
+[0.0,
+ 0.027697699183398698,
+ 0.0787273907854564]
+
+a_plus =
+[2.8876399513016535,
+ 16.346210075817577,
+ 2.778842969339726]
+
+b_plus =
+[0.0,
+ 1.2332130670667256,
+ 0.0]
+```
+
+## 66.6 Full shared Qiskit workflow
+
+The entire chain was executed with:
+
+```text
+BACKEND="qiskit"
+N=2
+seed=0
+target_err=1e-4
+starting_depth=1
+pre_empt_layers=1
+gs=False
+```
+
+Result:
+
+```text
+GS error          = 5.64737793247e-05
+GS target         = 1e-4
+optimizer success = True
+accepted depth    = 1
+GF relative error = 0.013431336315818446
+```
+
+## 66.7 Full shared Qulacs regression
+
+The same high-level workflow was then run with:
+
+```text
+BACKEND="qulacs"
+```
+
+Result:
+
+```text
+VQE energy        = -5.063959182148379
+GS error          = 5.647380331574858e-05
+phi- norm         = 0.14825056999428926
+phi+ norm         = 0.9889498311321803
+GF relative error = 0.013431336605184538
+optimizer success = True
+accepted depth    = 1
+```
+
+The full-workflow GF relative-error difference was approximately:
+
+```text
+2.89e-10
+```
+
+## 66.8 Removal of the duplicated high-level Qiskit driver
+
+After both full workflows passed, executable references to the old high-level Qiskit API were removed in this order:
+
+1. remove high-level Qiskit re-exports from `qiskit_port/__init__.py`,
+2. convert `qiskit_port/smoke_test_qiskit.py` to use shared `dmft.py`,
+3. rerun import and smoke tests,
+4. verify no executable `.py` file imports the old driver,
+5. remove `qiskit_port/dmft_qiskit.py`,
+6. rerun imports and the smoke test.
+
+Post-removal validation:
+
+```text
+qiskit_port import: OK
+dmft import: OK
+solve_vqe_qiskit available: True
+```
+
+and:
+
+```text
+SHARED QISKIT BACKEND SMOKE TEST
+backend          = qiskit
+system_size      = 2
+VQE energy       = -5.0639591821482135
+GS overlap error ~= 5.64738e-05
+optimizer success= True
+
+PASSED
+```
+
+## 66.9 Documentation/tutorial migration
+
+The handoff material was updated so future developers are not instructed to use an API that no longer exists.
+
+Historical references to the old Qiskit-specific driver remain in this document only where they describe real development events.
+
+## 66.10 Final architecture conclusion
+
+The final project is no longer:
+
+```text
+two similar high-level programs that must be kept synchronized
+```
+
+It is:
+
+```text
+one scientific workflow
+    +
+two backend implementations
+```
+
+A change to shared experiment logic should now be made once in `dmft.py` and regression-tested with both backends.
+
+A change to backend-specific numerical implementation should remain confined to the corresponding backend layer and be checked with the fixed-parameter equivalence tests documented throughout this file.

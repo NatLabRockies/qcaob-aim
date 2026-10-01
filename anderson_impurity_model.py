@@ -13,7 +13,7 @@ from qulacs import ParametricQuantumCircuit, QuantumState
 from qulacs.quantum_operator import create_quantum_operator_from_openfermion_text
 from qulacsvis import circuit_drawer
 from n_site_graph_creation import create_connected_graphs, AIMSiteModelsEnum
-from numpy import Inf
+from numpy import inf as Inf
 import sys
 import os
 from scipy.optimize import approx_fprime, OptimizeResult
