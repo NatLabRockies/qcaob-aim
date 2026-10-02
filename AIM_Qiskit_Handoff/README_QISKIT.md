@@ -531,6 +531,115 @@ If a developer needs direct access to returned records for debugging, benchmarki
 
 ---
 
+
+# Running Qiskit from the terminal
+
+Run commands from the **repository root**, not from inside
+`AIM_Qiskit_Handoff/`.
+
+For the current repository layout, first move to the repository root:
+
+```bash
+cd /Users/aporter2/Downloads/nlr_qc/qcaob-aim
+```
+
+The following command launches Python inside the project's Pipenv
+environment, selects the Qiskit backend, and runs the shared automatic
+ground-state depth search:
+
+```bash
+python3 -m pipenv run python - <<'PY'
+import dmft
+
+dmft.BACKEND = "qiskit"
+
+dmft.run_gs_error_experiment(
+    system_size=4,
+    seed=0,
+    target_err=1e-4,
+    maxiters=int(1e6),
+    gs_gtol=5e-4,
+    gf_gtol=5e-5,
+    pre_empt_layers=4,
+    starting_depth=1,
+    gs=True,
+    display=True,
+    plot=False,
+)
+PY
+```
+
+The `<<'PY' ... PY` syntax is a shell **here-document**. It means that
+the Python code between the two `PY` markers is passed directly to the
+Python interpreter. There is no separate `.py` file containing this
+whole command.
+
+The function being called is:
+
+```python
+dmft.run_gs_error_experiment(...)
+```
+
+and that function lives in the repository's shared:
+
+```text
+dmft.py
+```
+
+Because:
+
+```python
+dmft.BACKEND = "qiskit"
+```
+
+is set before the function call, the shared workflow dispatches the
+backend-specific quantum work to the Qiskit implementation.
+
+With:
+
+```python
+gs=True
+```
+
+the run stops after the ground-state depth search. It does **not** run
+the variational-Lanczos Green's-function calculation.
+
+The results are printed directly in the terminal because:
+
+```python
+display=True
+```
+
+is enabled.
+
+For the validated shared `N=4`, `seed=0`, `target_err=1e-4` case, the
+search should progress through the ansatz depths and first satisfy the
+target at approximately:
+
+```text
+L = 4
+```
+
+To run the full ground-state plus Green's-function workflow, use the
+same command but change:
+
+```python
+gs=False
+```
+
+and, if a plot is desired:
+
+```python
+plot=True
+```
+
+The `AIM_Qiskit_Handoff/` directory contains the documentation for this
+workflow. The executable code remains in the repository root and
+`qiskit_port/`.
+
+---
+
+
 # Ground-state-only depth search
 
 During development, it is often better to stop after the ground-state stage.
