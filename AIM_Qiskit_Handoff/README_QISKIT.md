@@ -1,3 +1,89 @@
+# Qiskit setup
+
+This document assumes the base repository environment has already been
+created using the instructions in the repository's main:
+
+[`README.md`](README.md)
+
+The original project uses Pipenv to manage the Python environment. From
+the repository root:
+
+```bash
+python3 -m pip install --upgrade pip
+pip install virtualenv
+pip install pipenv
+
+python3 -m pipenv install
+```
+
+Commands in this handoff are written using:
+
+```bash
+python3 -m pipenv run <command>
+```
+
+so entering an interactive `pipenv shell` is not required.
+
+## Verify the Qiskit dependencies
+
+```bash
+python3 -m pipenv run python -c "import numpy, scipy, qiskit, openfermion, dmft, qiskit_port; print('Core imports: OK')"
+```
+
+If Qiskit Aer is installed:
+
+```bash
+python3 -m pipenv run python -c "import qiskit_aer; print('Qiskit Aer: OK')"
+```
+
+Syntax-check the shared and Qiskit-specific source files:
+
+```bash
+python3 -m pipenv run python -m py_compile \
+    dmft.py \
+    qiskit_port/qiskit_utils.py \
+    qiskit_port/qiskit_ansatz.py \
+    qiskit_port/qiskit_vqe.py \
+    qiskit_port/smoke_test_qiskit.py
+```
+
+## Select the backend
+
+Qiskit:
+
+```python
+import dmft
+dmft.BACKEND = "qiskit"
+```
+
+Qulacs:
+
+```python
+import dmft
+dmft.BACKEND = "qulacs"
+```
+
+## First Qiskit test
+
+```bash
+python3 -m pipenv run python qiskit_port/smoke_test_qiskit.py
+```
+
+Expected approximately:
+
+```text
+backend          = qiskit
+system_size      = 2
+seed             = 0
+VQE energy       = -5.0639591821482135
+GS overlap error ~= 5.64738e-05
+optimizer success= True
+
+PASSED
+```
+
+---
+
 # AIM Qiskit Port
 
 Qiskit backend for the Anderson Impurity Model (AIM) ground-state VQE and variational-Lanczos Green's-function workflow originally implemented with Qulacs.
@@ -16,9 +102,9 @@ The former duplicated high-level file `qiskit_port/dmft_qiskit.py` has been remo
 
 If this is your first time opening the project, read:
 
-[`START_HERE.md`](START_HERE.md)
+[`ONBOARDING.md`](ONBOARDING.md)
 
-That document contains the detailed onboarding guide, including:
+That document gives the quick-start path into the project. This `README_QISKIT.md` is the full technical reference, including:
 
 - what the AIM workflow is doing,
 - repository structure,
@@ -40,7 +126,7 @@ python3 -m pipenv run python qiskit_port/smoke_test_qiskit.py
 After the smoke test passes, open the Qiskit tutorial notebook. In the current repository this is typically:
 
 ```text
-aim_tutorial_qiskit_final.ipynb
+aim_tutorial_merged.ipynb
 ```
 
 The tutorial was designed to mirror the original Qulacs tutorial so the two implementations can be followed side by side.
@@ -105,7 +191,6 @@ The full debugging history and numerical validation record are in:
 
 [`DEVELOPER_NOTES.md`](DEVELOPER_NOTES.md)
 
-`VALIDATION.md` is retained only as a compatibility pointer to the developer notes.
 
 ---
 
@@ -883,19 +968,19 @@ Do not reintroduce the retired API unless a deliberate compatibility layer is re
 # Handoff file map
 
 ```text
-README_QISKIT.md
-    Project front page and quick-reference navigation.
+README.md
+    Top-level handoff index and documentation map.
 
-START_HERE.md
-    Detailed onboarding, theory, operations, setup, and troubleshooting.
+ONBOARDING.md
+    New-developer quick start and reading order.
+
+README_QISKIT.md
+    Full current technical guide for the merged Qiskit/Qulacs workflow.
 
 DEVELOPER_NOTES.md
-    May--September debugging history plus combined validation record.
+    Development history, debugging record, validation evidence, and regression values.
 
-VALIDATION.md
-    Compatibility pointer to DEVELOPER_NOTES.md.
-
-aim_tutorial_qiskit_final.ipynb
+aim_tutorial_merged.ipynb
     Executable Qiskit tutorial matching the original Qulacs tutorial structure.
 
 dmft.py
@@ -922,16 +1007,19 @@ qiskit_port/qiskit_vqe.py
 # Recommended reading order
 
 ```text
-README_QISKIT.md
+README.md
     |
     v
-START_HERE.md
+ONBOARDING.md
+    |
+    v
+README_QISKIT.md
     |
     v
 qiskit_port/smoke_test_qiskit.py
     |
     v
-aim_tutorial_qiskit_final.ipynb
+aim_tutorial_merged.ipynb
 ```
 
 When debugging or modifying internals:

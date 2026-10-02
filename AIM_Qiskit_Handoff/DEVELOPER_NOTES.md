@@ -2,9 +2,10 @@
 
 This is the combined developer-history and validation document for the Qiskit port of the Anderson Impurity Model (AIM) VQE + variational-Lanczos Green's-function workflow.
 
-The purpose of this file is different from `START_HERE.md`:
+The purpose of this file is different from `ONBOARDING.md`:
 
-- `START_HERE.md` explains how the code works and how to get started.
+- `ONBOARDING.md` gives a new developer the quick-start path into the project.
+- `README_QISKIT.md` is the current technical usage/reference guide.
 - **This file records how the code got to its current state, what broke along the way, how each problem was isolated, what tests were run, what fixes were made, and what numerical values should still be reproducible.**
 
 This history covers the project from the initial codebase study in **May 2026** through the final Qiskit/Qulacs validation, shared-backend merge, and handoff work completed at the end of **September / beginning of October 2026**.
