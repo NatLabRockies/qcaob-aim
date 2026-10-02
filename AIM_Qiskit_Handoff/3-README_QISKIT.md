@@ -126,10 +126,69 @@ python3 -m pipenv run python qiskit_port/smoke_test_qiskit.py
 After the smoke test passes, open the Qiskit tutorial notebook. In the current repository this is typically:
 
 ```text
-aim_tutorial_merged.ipynb
+aim_tutorial_qiskit_final.ipynb
 ```
 
 The tutorial was designed to mirror the original Qulacs tutorial so the two implementations can be followed side by side.
+
+---
+
+# Command-line arguments
+
+The shared `dmft.py` driver defines its command-line interface with Python's
+`argparse` module. To see the current argument list and built-in help directly
+from the code, run:
+
+```bash
+python3 -m pipenv run python dmft.py -h
+```
+
+The available arguments are:
+
+| Argument | Meaning | Default |
+|---|---|---:|
+| `-size`, `--system_size` | AIM system size for the experiment. | required |
+| `-s`, `--seed` | Seed number for the VQE run. | `0` |
+| `-t`, `--target_error` | Target ground-state overlap error used for the depth/scaling search. | required |
+| `-m`, `--maxiters` | Maximum iterations for the particle-removal and particle-addition VQE optimizations. | `1e6` |
+| `-g`, `--gtol` | Gradient-norm tolerance for the Green's-function / variational-Lanczos optimizer. | `5e-5` |
+| `--gs_gtol` | Initial gradient-norm tolerance for the ground-state optimizer. | `5e-4` |
+| `-pel`, `--pre_empt_layers` | Maximum VQE layer count considered during the scaling/depth search. | `1` |
+| `-svd`, `--starting_vqe_depth` | Initial VQE depth used by the optimizer and ansatz. | `1` |
+| `-gs`, `--ground_state` | Run only the ground-state determination and skip the Green's-function calculation. | `False` |
+| `-d`, `--display` | Display calculation information. | `False` |
+| `-p`, `--plot` | Plot the exact and variational Green's-function results. | `False` |
+
+The command-line entry point passes these values into
+`run_gs_error_experiment(...)`.
+
+A small ground-state-only run is:
+
+```bash
+python3 -m pipenv run python dmft.py \
+    -s 0 \
+    -size 2 \
+    -t 1e-4 \
+    -pel 2 \
+    -svd 1 \
+    -gs \
+    -d
+```
+
+A depth search that allows up to four VQE layers is:
+
+```bash
+python3 -m pipenv run python dmft.py \
+    -s 0 \
+    -size 4 \
+    -t 1e-4 \
+    -pel 4 \
+    -svd 1 \
+    -gs \
+    -d
+```
+
+`starting_vqe_depth` must not be greater than `pre_empt_layers`.
 
 ---
 
@@ -530,115 +589,6 @@ Its results are printed when `display=True` and are saved through the existing r
 If a developer needs direct access to returned records for debugging, benchmarking, or tests, use `calculate_gs()` and `calculate_gf()` directly.
 
 ---
-
-
-# Running Qiskit from the terminal
-
-Run commands from the **repository root**, not from inside
-`AIM_Qiskit_Handoff/`.
-
-For the current repository layout, first move to the repository root:
-
-```bash
-cd /Users/aporter2/Downloads/nlr_qc/qcaob-aim
-```
-
-The following command launches Python inside the project's Pipenv
-environment, selects the Qiskit backend, and runs the shared automatic
-ground-state depth search:
-
-```bash
-python3 -m pipenv run python - <<'PY'
-import dmft
-
-dmft.BACKEND = "qiskit"
-
-dmft.run_gs_error_experiment(
-    system_size=4,
-    seed=0,
-    target_err=1e-4,
-    maxiters=int(1e6),
-    gs_gtol=5e-4,
-    gf_gtol=5e-5,
-    pre_empt_layers=4,
-    starting_depth=1,
-    gs=True,
-    display=True,
-    plot=False,
-)
-PY
-```
-
-The `<<'PY' ... PY` syntax is a shell **here-document**. It means that
-the Python code between the two `PY` markers is passed directly to the
-Python interpreter. There is no separate `.py` file containing this
-whole command.
-
-The function being called is:
-
-```python
-dmft.run_gs_error_experiment(...)
-```
-
-and that function lives in the repository's shared:
-
-```text
-dmft.py
-```
-
-Because:
-
-```python
-dmft.BACKEND = "qiskit"
-```
-
-is set before the function call, the shared workflow dispatches the
-backend-specific quantum work to the Qiskit implementation.
-
-With:
-
-```python
-gs=True
-```
-
-the run stops after the ground-state depth search. It does **not** run
-the variational-Lanczos Green's-function calculation.
-
-The results are printed directly in the terminal because:
-
-```python
-display=True
-```
-
-is enabled.
-
-For the validated shared `N=4`, `seed=0`, `target_err=1e-4` case, the
-search should progress through the ansatz depths and first satisfy the
-target at approximately:
-
-```text
-L = 4
-```
-
-To run the full ground-state plus Green's-function workflow, use the
-same command but change:
-
-```python
-gs=False
-```
-
-and, if a plot is desired:
-
-```python
-plot=True
-```
-
-The `AIM_Qiskit_Handoff/` directory contains the documentation for this
-workflow. The executable code remains in the repository root and
-`qiskit_port/`.
-
----
-
 
 # Ground-state-only depth search
 
@@ -1089,7 +1039,7 @@ README_QISKIT.md
 DEVELOPER_NOTES.md
     Development history, debugging record, validation evidence, and regression values.
 
-aim_tutorial_merged.ipynb
+aim_tutorial_qiskit_final.ipynb
     Executable Qiskit tutorial matching the original Qulacs tutorial structure.
 
 dmft.py
@@ -1128,7 +1078,7 @@ README_QISKIT.md
 qiskit_port/smoke_test_qiskit.py
     |
     v
-aim_tutorial_merged.ipynb
+aim_tutorial_qiskit_final.ipynb
 ```
 
 When debugging or modifying internals:
