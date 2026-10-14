@@ -24,7 +24,7 @@ from numpy.typing import NDArray
 # QUANTUM BACKEND
 # ============================================================
 
-BACKEND = "qulacs"
+BACKEND = "qiskit"
 # BACKEND = "qulacs"
 
 VALID_BACKENDS = {
@@ -62,6 +62,34 @@ def main():
     parser.add_argument("-p", "--plot", action=argparse.BooleanOptionalAction, default=False,
                         help="Flag to plot Green's function (exact and VQE) for each Green's function calculation.")
 
+    parser.add_argument(
+        "--simulation_mode",
+        choices=["statevector", "shots"],
+        default="statevector",
+        help="Qiskit ground-state simulation mode.",
+    )
+    
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=1000,
+        help="Number of Aer measurement shots when simulation_mode='shots'.",
+    )
+    
+    parser.add_argument(
+        "--shot_seed",
+        type=int,
+        default=1234,
+        help="Random seed used for Aer finite-shot measurements.",
+    )
+
+    parser.add_argument(
+        "--vqe_seed",
+        type=int,
+        default=0,
+        help="Random seed used for the initial VQE parameters.",
+    )
+
     args = parser.parse_args()
 
     if args.starting_vqe_depth > args.pre_empt_layers:
@@ -79,6 +107,10 @@ def main():
         gs=args.ground_state,
         display=args.display,
         plot=args.plot,
+        simulation_mode=args.simulation_mode,
+        shots=args.shots,
+        shot_seed=args.shot_seed,
+        vqe_seed=args.vqe_seed,
     )
 
     return
@@ -202,6 +234,10 @@ def run_gs_error_experiment(
     gs: bool,
     display: bool,
     plot: bool,
+    simulation_mode: str = "statevector",
+    shots: int = 1000,
+    shot_seed: int = 1234,
+    vqe_seed: int = 0,
 ) -> None:
     """
     Run calculate_gs() as a subroutine in order to hit target threshold ground state energy relative error. If error
@@ -227,7 +263,16 @@ def run_gs_error_experiment(
     if display:
         print("qubit Hamiltonian:\n", str(qubit_hamiltonian))
 
-    optimizer = "BFGS"
+    # Ground-state optimizer.
+    if simulation_mode == "shots":
+        gs_optimizer = "SPSA"
+    else:
+        gs_optimizer = "BFGS"
+
+    # The current Green's-function/Lanczos stage calls
+    # scipy.optimize.minimize(), which does not support SPSA.
+    gf_optimizer = "BFGS"
+
     conv_tol = 1e-6
     w = np.linspace(-25, 25, 1000, dtype=np.complex128) + 1j * 0.1
 
@@ -262,9 +307,29 @@ def run_gs_error_experiment(
             print("-" * 75)
             print(f"Starting run with {n_layers} layers on {system_size}-site case with seed {seed}, gs gtol {gs_gtol:.3e}")
 
-        record_gs, exact_gs, min_vqe_angles = calculate_gs(impurity_orbital, test_model, up_qubit_indices, down_qubit_indices, connected_graphs,
-                                                        qubit_hamiltonian, n_layers, gs_gtol, optimizer, gs_gtol, maxiters, conv_tol,
-                                                        display=display, gs=gs, checkpoint_file=checkpoint_file, results_file=results_file)
+        record_gs, exact_gs, min_vqe_angles = calculate_gs(
+            impurity_orbital,
+            test_model,
+            up_qubit_indices,
+            down_qubit_indices,
+            connected_graphs,
+            qubit_hamiltonian,
+            n_layers,
+            gs_gtol,
+            gs_optimizer,
+            gs_gtol,
+            maxiters,
+            conv_tol,
+            display=display,
+            gs=gs,
+            checkpoint_file=checkpoint_file,
+            results_file=results_file,
+            simulation_mode=simulation_mode,
+            shots=shots,
+            shot_seed=shot_seed,
+            vqe_seed=vqe_seed,
+        )
+        
         t1 = time.time()
 
         ###
@@ -298,7 +363,7 @@ def run_gs_error_experiment(
     # After obtaining the desired accuracy for the variationally prepared gs + gs is set to False, find the green's function
     if (record_gs["overall_success"] == True) & (gs == False):
         record_gf = calculate_gf(impurity_orbital, test_model, n_orbitals, up_qubit_indices, down_qubit_indices, connected_graphs,
-                              qubit_hamiltonian, n_layers, w, optimizer, gf_gtol, vqe_gs_energy=record_gs['vqe_gs_energy'],
+                              qubit_hamiltonian, n_layers, w, gf_optimizer, gf_gtol, vqe_gs_energy=record_gs['vqe_gs_energy'],
                               vqe_spin=record_gs['vqe_spin'], vqe_charge=record_gs['vqe_charge'], exact_gs=exact_gs,
                               exact_spin=record_gs['exact_spin'], exact_charge=record_gs['exact_charge'], minimum_angles=min_vqe_angles,
                               record_keeping=record_gs, display=display, plot=plot)
@@ -334,7 +399,12 @@ def _solve_vqe_gs_backend(
     display=False,
     checkpoint_file="",
     results_file="",
+    simulation_mode="statevector",
+    shots=1000,
+    seed=1234,
+    vqe_seed=0,
 ):
+    
     """
     Solve the VQE ground state using the selected backend.
 
@@ -378,6 +448,10 @@ def _solve_vqe_gs_backend(
             gs_gtol=gs_gtol,
             maxiter=maxiters,
             display=display,
+            simulation_mode=simulation_mode,
+            shots=shots,
+            seed=seed,
+            vqe_seed=vqe_seed,
         )
 
         vqe_nu = record_keeping["vqe_nu"]
@@ -441,10 +515,15 @@ def calculate_gs(
         maxiters: int,
         conv_tol: float,
         display: bool = False,
-        gs: bool = False, 
-        checkpoint_file: str= '',
+        gs: bool = False,
+        checkpoint_file: str = '',
         results_file: str = '',
+        simulation_mode: str = "statevector",
+        shots: int = 1000,
+        shot_seed: int = 1234,
+        vqe_seed: int = 0,
 ) -> tuple[dict, NDArray]:
+    
     """
     Given params, compute exact ground state solution by exact diagonalization. Repeat the process for the same
     Hamiltonian but instead by minimizing the energy over VQE run on individual spin-charge sectors.
@@ -501,6 +580,10 @@ def calculate_gs(
         display=display,
         checkpoint_file=checkpoint_file,
         results_file=results_file,
+        simulation_mode=simulation_mode,
+        shots=shots,
+        seed=shot_seed,
+        vqe_seed=vqe_seed,
     )
     record_keeping.update(record_vqe_gs)
     ###
@@ -794,6 +877,74 @@ def calculate_gf(
     :return: Dictionary of selected results.
     """
 
+    # Work on a copy so the ground-state record remains intact.
+    record_keeping = dict(record_keeping)
+
+    # Preserve optimizer metadata for reporting/plotting.
+    # The ground-state run may have used SPSA in finite-shot mode,
+    # while the Green's-function/Lanczos stage currently uses BFGS.
+    record_keeping["gs_optimizer"] = record_keeping.get(
+        "optimizer",
+        "BFGS",
+    )
+    record_keeping["gf_optimizer"] = optimizer
+
+    # Keep the existing key aligned with the optimizer used by the
+    # Green's-function/Lanczos stage.
+    record_keeping["optimizer"] = optimizer
+
+    # Route the Green's-function calculation through the selected backend.
+    if BACKEND == "qiskit":
+        g_vqe, g_exact, record_keeping = _calculate_gf_qiskit_backend(
+            impurity_orbital=impurity_orbital,
+            test_model=test_model,
+            n_orbitals=n_orbitals,
+            up_qubit_indices=up_qubit_indices,
+            down_qubit_indices=down_qubit_indices,
+            connected_graphs=connected_graphs,
+            qubit_hamiltonian=qubit_hamiltonian,
+            vqe_depth=vqe_depth,
+            w=w,
+            optimizer=optimizer,
+            gf_gtol=gf_gtol,
+            vqe_gs_energy=vqe_gs_energy,
+            vqe_spin=vqe_spin,
+            vqe_charge=vqe_charge,
+            exact_gs=exact_gs,
+            exact_spin=exact_spin,
+            exact_charge=exact_charge,
+            minimum_angles=minimum_angles,
+            record_keeping=record_keeping,
+        )
+
+        rel_error, record_rel_errors = calculate_rel_errors(
+            g_vqe,
+            g_exact,
+        )
+        record_keeping.update(record_rel_errors)
+
+        if display:
+            print_record(record_keeping, gf=True)
+
+        if plot:
+            plot_gfs(
+                w=w,
+                g_vqe=g_vqe,
+                g_exact=g_exact,
+                impurity_orbital=impurity_orbital,
+                vqe_depth=vqe_depth,
+                gtol=gf_gtol,
+                optimizer=optimizer,
+                relative_error=rel_error,
+                record_keeping=record_keeping,
+            )
+
+        return record_keeping
+
+    if BACKEND != "qulacs":
+        raise ValueError(f"Unsupported backend: {BACKEND!r}")
+
+
     ###
     # 3 Get Krylov dimensions
     # 3.1 Exact
@@ -854,7 +1005,8 @@ def calculate_gf(
             vqe_depth=vqe_depth,
             gtol=gf_gtol,
             optimizer=optimizer,
-            relative_error=rel_error
+            relative_error=rel_error,
+            record_keeping=record_keeping,
             )
 
     return record_keeping
@@ -940,6 +1092,33 @@ def print_record(
     return None
 
 
+
+def _json_default(obj):
+    """
+    Convert common NumPy/scientific-Python objects stored in result
+    dictionaries into JSON-serializable Python objects.
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    if isinstance(obj, np.generic):
+        return obj.item()
+
+    if isinstance(obj, complex):
+        return {
+            "real": float(obj.real),
+            "imag": float(obj.imag),
+        }
+
+    if isinstance(obj, set):
+        return list(obj)
+
+    # Keep the failure explicit for unsupported objects.
+    raise TypeError(
+        f"Object of type {type(obj).__name__} is not JSON serializable"
+    )
+
+
 def save_to_file(
         target_err: float,
         pre_empt_layers: int,
@@ -976,42 +1155,137 @@ def save_to_file(
     dest = dir_name + "/" + fname
 
     with open(dest, "w") as f:
-        json.dump(record, f, default=int, indent=4)
+        json.dump(record, f, default=_json_default, indent=4)
 
     return None
 
 
 def plot_gfs(
-    w: NDArray[np.complex128],
-    g_vqe: NDArray[np.complex128],
-    g_exact: NDArray[np.complex128],
-    impurity_orbital: int,
-    vqe_depth: int,
-    gtol: float,
-    optimizer: str,
-    relative_error: float,
+    w,
+    g_vqe,
+    g_exact,
+    impurity_orbital,
+    vqe_depth,
+    gtol,
+    optimizer,
+    relative_error,
+    record_keeping,
 ) -> None:
     """
-    Given kwargs including the calculated Green's function from both methodologies, plot the real and imaginary parts.
-    :param w: Complex, linearly-spaced frequency array containing broadening term.
-    :param g_vqe: Green's function generated by VQE
-    :param g_exact: Green's function generated by exact solution
-    :param impurity_orbital: Index of the impurity orbital.
-    :param vqe_depth: Number of layers for the SciPy optimizers and ansatz.
-    :param gtol: Gradient norm tolerance for the VQE optimizer.
-    :param optimizer: Type of optimizer for VQE.
-    :param relative_error: Relative error in the Green's function for the two methodologies.
-    :return: None
+    Plot the real Green's function and spectral function together.
+
+    The title reports the backend, simulation mode, system size,
+    ansatz depth, ground-state optimizer, Green's-function optimizer,
+    Green's-function tolerance, and relative error.
     """
 
-    plt.plot(w.real, g_vqe.real, "b-", label="VQE real")
-    plt.plot(w.real, -g_vqe.imag / np.pi, "g-", label="=VQE spectral")
-    plt.plot(w.real, g_exact.real, color="tab:blue", linestyle="--", label="exact real")
-    plt.plot(w.real, -g_exact.imag / np.pi, color="tab:green", linestyle="--", label="exact spectral")
+    # --------------------------------------------------------
+    # Plot metadata
+    # --------------------------------------------------------
+    backend_label = {
+        "qiskit": "Qiskit",
+        "qulacs": "Qulacs",
+    }.get(
+        str(BACKEND).lower(),
+        str(BACKEND),
+    )
+
+    simulation_mode = str(
+        record_keeping.get(
+            "simulation_mode",
+            "statevector",
+        )
+    ).lower()
+
+    shots = record_keeping.get(
+        "shots",
+        None,
+    )
+
+    # Qulacs currently follows the deterministic/statevector path.
+    if (
+        backend_label == "Qiskit"
+        and simulation_mode == "shots"
+    ):
+        if shots is not None:
+            mode_label = f"Shots ({int(shots):,})"
+        else:
+            mode_label = "Shots"
+    else:
+        mode_label = "Statevector"
+
+    system_size = record_keeping.get(
+        "n_sites",
+        "?",
+    )
+
+    gs_optimizer = record_keeping.get(
+        "gs_optimizer",
+        "BFGS",
+    )
+
+    gf_optimizer = record_keeping.get(
+        "gf_optimizer",
+        optimizer,
+    )
+
+    # --------------------------------------------------------
+    # Combined real + spectral plot
+    # --------------------------------------------------------
+    plt.figure(
+        figsize=(12.5, 6),
+    )
+
+    plt.plot(
+        w.real,
+        g_vqe.real,
+        "b-",
+        label="VQE real",
+    )
+    plt.plot(
+        w.real,
+        -g_vqe.imag / np.pi,
+        "g-",
+        label="VQE spectral",
+    )
+    plt.plot(
+        w.real,
+        g_exact.real,
+        color="tab:blue",
+        linestyle="--",
+        label="exact real",
+    )
+    plt.plot(
+        w.real,
+        -g_exact.imag / np.pi,
+        color="tab:green",
+        linestyle="--",
+        label="exact spectral",
+    )
+
+    plt.xlabel(
+        r"$\omega$"
+    )
+    plt.ylabel(
+        r"$G^{ret}(\omega)$ / $A(\omega)$"
+    )
+
+    title = (
+        f"{backend_label} | {mode_label} | "
+        rf"$N_{{sys}}={system_size}$ | "
+        rf"$n_{{layers}}={vqe_depth}$ | "
+        f"GS: {gs_optimizer} | "
+        f"GF: {gf_optimizer} | "
+        f"gtol={gtol:.0e} | "
+        f"GF Rel. Err.={relative_error:.3f}"
+    )
+
+    plt.title(
+        title,
+        fontsize=12,
+    )
     plt.legend()
-    plt.xlabel(r"$\omega$")
-    plt.ylabel(r"$G^{ret}_%s(\omega)$" % impurity_orbital)
-    plt.title(r"$n_{layers}=%s, gtol=%s$, %s, GF rel err=%.3f" % (vqe_depth, gtol, optimizer, relative_error))
+    plt.tight_layout()
     plt.show()
 
     return None

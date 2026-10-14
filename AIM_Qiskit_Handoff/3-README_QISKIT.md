@@ -126,7 +126,7 @@ python3 -m pipenv run python qiskit_port/smoke_test_qiskit.py
 After the smoke test passes, open the Qiskit tutorial notebook. In the current repository this is typically:
 
 ```text
-aim_tutorial_qiskit_final.ipynb
+aim_tutorial_merged.ipynb
 ```
 
 The tutorial was designed to mirror the original Qulacs tutorial so the two implementations can be followed side by side.
@@ -158,9 +158,19 @@ The available arguments are:
 | `-gs`, `--ground_state` | Run only the ground-state determination and skip the Green's-function calculation. | `False` |
 | `-d`, `--display` | Display calculation information. | `False` |
 | `-p`, `--plot` | Plot the exact and variational Green's-function results. | `False` |
+| `--simulation_mode` | Qiskit ground-state simulation mode: `statevector` or `shots`. | `statevector` |
+| `--shots` | Number of Qiskit Aer measurement shots per finite-shot VQE energy estimate. | `1000` |
+| `--shot_seed` | Random seed used for Qiskit Aer finite-shot measurements. | `1234` |
+| `--vqe_seed` | Random seed used for the initial Qiskit VQE parameters. | `0` |
 
 The command-line entry point passes these values into
 `run_gs_error_experiment(...)`.
+
+For Qiskit, `--simulation_mode statevector` keeps the deterministic
+ground-state energy evaluation, while `--simulation_mode shots` switches the
+ground-state VQE objective to the Qiskit Aer finite-shot estimator. The
+finite-shot path uses SPSA for the ground-state optimization; the current
+Green's-function / variational-Lanczos stage continues to use BFGS.
 
 A small ground-state-only run is:
 
@@ -189,6 +199,214 @@ python3 -m pipenv run python dmft.py \
 ```
 
 `starting_vqe_depth` must not be greater than `pre_empt_layers`.
+
+---
+
+# Qiskit Aer finite-shot emulator
+
+The Qiskit backend can evaluate the **ground-state VQE objective** using a
+finite number of simulated measurements instead of an exact statevector
+expectation value.
+
+For a variational state $|\psi(\theta)\rangle$, statevector mode evaluates
+
+$$
+E(\theta)
+=
+\langle\psi(\theta)|H|\psi(\theta)\rangle,
+$$
+
+deterministically. Finite-shot mode instead estimates
+
+$$
+\hat{E}(\theta)
+=
+E(\theta)+\epsilon_{\mathrm{shot}}.
+$$
+
+The implementation converts the OpenFermion Hamiltonian to a Qiskit
+`SparsePauliOp` and evaluates the Hamiltonian expectation value with the Qiskit
+Aer `Estimator` using the requested number of shots.
+
+The statistical sampling uncertainty generally decreases approximately as
+
+$$
+\frac{1}{\sqrt{N_{\mathrm{shots}}}}.
+$$
+
+Increasing the shot count therefore reduces measurement-sampling uncertainty,
+but does **not** guarantee that the classical optimizer will find a better VQE
+minimum.
+
+## What finite-shot mode currently affects
+
+The current merged workflow is:
+
+```text
+finite-shot Aer energy estimates
+            |
+            v
+ground-state VQE
+            |
+            v
+SPSA optimization
+            |
+            v
+shot-optimized ground state
+            |
+            v
+variational-Lanczos / Green's-function stage
+```
+
+Important distinctions:
+
+- the **VQE ground-state energy evaluations** are finite-shot quantities;
+- the **exact ground-state energy** remains an exact classical-diagonalization
+  reference;
+- when an exact energy is evaluated at the shot-optimized parameters, that
+  deterministic value is useful for separating sampling error from
+  optimization/ansatz error;
+- the current Green's-function / variational-Lanczos stage is not itself
+  evaluated with finite-shot measurements.
+
+Therefore, a Green's-function plot from a shot run is a Green's function
+generated from a **shot-optimized ground state**. The Green's-function curve
+itself is not sampled point-by-point with shots.
+
+The shot emulator represents finite measurement sampling. It is **not** by
+itself a full hardware-noise model with gate errors, decoherence, or readout
+error.
+
+## Optimizers
+
+The current shared workflow uses:
+
+```text
+statevector ground-state VQE  -> BFGS
+finite-shot ground-state VQE  -> SPSA
+Green's-function/Lanczos      -> BFGS
+```
+
+SPSA is used for the finite-shot ground-state objective because it is more
+appropriate for a noisy sampled objective than the deterministic BFGS path.
+
+## Run finite-shot VQE from the terminal
+
+Ground-state-only example:
+
+```bash
+python3 -m pipenv run python dmft.py \
+    -s 0 \
+    -size 2 \
+    -svd 1 \
+    -pel 1 \
+    -t 1.0 \
+    -m 500 \
+    -gs \
+    -d \
+    --simulation_mode shots \
+    --shots 1000 \
+    --shot_seed 1234 \
+    --vqe_seed 0
+```
+
+`-gs` stops after the ground-state calculation.
+
+To continue from a shot-optimized ground state into the Green's-function
+calculation, omit `-gs` and add `-p`:
+
+```bash
+python3 -m pipenv run python dmft.py \
+    -s 0 \
+    -size 3 \
+    -svd 2 \
+    -pel 2 \
+    -t 1.0 \
+    -m 500 \
+    -d \
+    -p \
+    --simulation_mode shots \
+    --shots 10000 \
+    --shot_seed 1234 \
+    --vqe_seed 0
+```
+
+To allow a depth search through layers 1 to 4:
+
+```bash
+python3 -m pipenv run python dmft.py \
+    -s 0 \
+    -size 3 \
+    -svd 1 \
+    -pel 4 \
+    -t 1e-4 \
+    -m 500 \
+    -gs \
+    -d \
+    --simulation_mode shots \
+    --shots 10000 \
+    --shot_seed 1234 \
+    --vqe_seed 0
+```
+
+Here `-svd 1` is the starting depth and `-pel 4` is the **maximum** depth.
+The search can stop before layer 4 if the ground-state overlap error satisfies
+the target given by `-t`. For a fixed-depth run, set `-svd` and `-pel` to the
+same value.
+
+## Run finite shots from the merged notebook
+
+Open:
+
+```text
+aim_tutorial_merged.ipynb
+```
+
+The notebook uses Jupyter's `%run` command so the example goes through the same
+`argparse` interface as a terminal run.
+
+Ground-state-only example:
+
+```python
+%run dmft.py \
+    -s 0 \
+    -size 2 \
+    -svd 1 \
+    -pel 1 \
+    -t 1.0 \
+    -m 500 \
+    -gs \
+    -d \
+    --simulation_mode shots \
+    --shots 1000 \
+    --shot_seed 1234 \
+    --vqe_seed 0
+```
+
+Green's-function example:
+
+```python
+%run dmft.py \
+    -s 0 \
+    -size 3 \
+    -svd 2 \
+    -pel 2 \
+    -t 1.0 \
+    -m 500 \
+    -d \
+    -p \
+    --simulation_mode shots \
+    --shots 10000 \
+    --shot_seed 1234 \
+    --vqe_seed 0
+```
+
+The syntax difference is:
+
+```text
+terminal:  python3 -m pipenv run python dmft.py ...
+notebook:  %run dmft.py ...
+```
 
 ---
 
@@ -381,7 +599,9 @@ Main responsibilities include:
 
 - cached parameterized ansatz templates,
 - Qiskit/Aer statevector generation,
+- finite-shot Qiskit Aer energy estimation,
 - VQE ground-state optimization,
+- SPSA optimization for finite-shot ground-state VQE,
 - ground-state reconstruction,
 - particle-removal and particle-addition seed states,
 - variational Lanczos cost evaluation,
@@ -740,6 +960,32 @@ For stronger backend-equivalence claims, use controlled same-parameter compariso
 
 ---
 
+# Green's-function plotting
+
+When `-p` is enabled, `dmft.py` plots the real Green's function and spectral
+function on the **same figure**.
+
+The figure contains:
+
+```text
+VQE real Green's function
+VQE spectral function
+exact real Green's function
+exact spectral function
+```
+
+with
+
+$$
+A(\omega)
+=
+-\frac{1}{\pi}\operatorname{Im}G(\omega).
+$$
+
+The VQE curves use solid lines and the exact reference curves use dashed lines.
+
+---
+
 # Important conventions
 
 These conventions are part of the validated implementation.
@@ -901,7 +1147,9 @@ Detailed numerical values are intentionally kept in `DEVELOPER_NOTES.md` so this
 
 # Performance
 
-The main Qiskit runtime cost is repeated statevector generation during optimization.
+For deterministic runs, a major Qiskit runtime cost is repeated statevector
+generation during optimization. In finite-shot mode, runtime also grows with
+the number of circuit evaluations and the requested shot count.
 
 The final port includes several optimizations:
 
@@ -931,7 +1179,7 @@ NumPy
 SciPy
 Matplotlib
 Qiskit
-Qiskit Aer        optional but recommended
+Qiskit Aer        required for finite-shot mode; recommended otherwise
 OpenFermion
 NetworkX
 Jupyter
@@ -974,15 +1222,18 @@ After a change, validate from cheapest to most expensive:
 ```text
 1. imports / py_compile
 2. qiskit_port/smoke_test_qiskit.py
-3. fixed-depth ground-state comparison
-4. automatic GS depth search
-5. controlled ground-state reconstruction
-6. phi- / phi+ comparison
-7. fixed-theta Lanczos cost
-8. removal/addition coefficient chains
-9. direct full Green's function
-10. full run_gs_error_experiment(..., gs=False)
-11. Qiskit vs Qulacs controlled comparison
+3. deterministic statevector ground-state regression
+4. finite-shot one-state energy-estimator check
+5. fixed-depth ground-state comparison
+6. automatic GS depth search
+7. shot-mode fixed-depth / depth-search check
+8. controlled ground-state reconstruction
+9. phi- / phi+ comparison
+10. fixed-theta Lanczos cost
+11. removal/addition coefficient chains
+12. direct full Green's function
+13. full run_gs_error_experiment(..., gs=False)
+14. Qiskit vs Qulacs controlled comparison
 ```
 
 The detailed expected values are in `DEVELOPER_NOTES.md`.
@@ -1039,8 +1290,8 @@ README_QISKIT.md
 DEVELOPER_NOTES.md
     Development history, debugging record, validation evidence, and regression values.
 
-aim_tutorial_qiskit_final.ipynb
-    Executable Qiskit tutorial matching the original Qulacs tutorial structure.
+aim_tutorial_merged.ipynb
+    Executable merged Qiskit/Qulacs tutorial, including finite-shot examples.
 
 dmft.py
     Shared high-level Qulacs/Qiskit AIM workflow.
@@ -1078,7 +1329,7 @@ README_QISKIT.md
 qiskit_port/smoke_test_qiskit.py
     |
     v
-aim_tutorial_qiskit_final.ipynb
+aim_tutorial_merged.ipynb
 ```
 
 When debugging or modifying internals:
@@ -1090,5 +1341,10 @@ DEVELOPER_NOTES.md
 The central maintenance rule is:
 
 > **First prove that Qiskit and Qulacs agree at the same parameters. Then investigate differences between independent optimizer runs.**
+
+For finite-shot debugging, also separate **sampling error** from
+**optimization/ansatz error** by comparing the sampled energy with a
+deterministic expectation value at the same optimized parameters whenever that
+diagnostic is available.
 
 That distinction prevents optimizer-path differences, ansatz limitations, state-ordering issues, and genuine implementation bugs from being confused with one another.

@@ -17,9 +17,12 @@ that can silently drift apart.
 
 import numpy as np
 
-from scipy.optimize import minimize, Bounds
+from scipy.optimize import minimize, Bounds, OptimizeResult
 
-from qiskit.quantum_info import Statevector
+from qiskit.quantum_info import (
+    Statevector,
+    SparsePauliOp,
+)
 from qiskit.circuit import ParameterVector
 
 # Optional faster statevector backend.
@@ -27,8 +30,10 @@ from qiskit.circuit import ParameterVector
 # is not installed.
 try:
     from qiskit_aer import AerSimulator
+    from qiskit_aer.primitives import Estimator as AerEstimator
 except ImportError:
     AerSimulator = None
+    AerEstimator = None
 
 
 from qiskit_port.qiskit_ansatz import (
@@ -67,6 +72,50 @@ _AER_STATEVECTOR_BACKEND = (
     if AerSimulator is not None
     else None
 )
+
+_AER_SHOT_ESTIMATOR = (
+    AerEstimator()
+    if AerEstimator is not None
+    else None
+)
+
+DEFAULT_SHOTS = 1000
+
+
+def openfermion_to_qiskit_hamiltonian(
+    qubit_hamiltonian,
+    n_qubits,
+):
+    """
+    Convert an OpenFermion QubitOperator into a Qiskit
+    SparsePauliOp using the Qiskit circuit qubit ordering.
+
+    This preserves the bit-order convention already validated
+    against the existing OpenFermion/statevector implementation.
+    """
+
+    pauli_terms = []
+
+    for term, coefficient in qubit_hamiltonian.terms.items():
+
+        label = ["I"] * n_qubits
+
+        for qubit_index, pauli in term:
+            label[
+                n_qubits - 1 - int(qubit_index)
+            ] = str(pauli)
+
+        pauli_terms.append(
+            (
+                "".join(label),
+                complex(coefficient),
+            )
+        )
+
+    return SparsePauliOp.from_list(
+        pauli_terms
+    )
+
 
 _ANSATZ_TEMPLATE_CACHE = {}
 
@@ -1663,6 +1712,153 @@ def ground_state_cost_function_qiskit(
     )
 
 
+def ground_state_cost_function_shots_qiskit(
+    params,
+    H_pauli,
+    n_qubits,
+    n_layers,
+    initial_occupations_indices,
+    connected_graphs,
+    shots=DEFAULT_SHOTS,
+    seed=1234,
+    compilation="generic",
+):
+    """
+    Estimate the VQE ground-state energy using finite-shot
+    Qiskit Aer measurements.
+
+    Unlike ground_state_cost_function_qiskit(), this function
+    does not construct or use a full statevector.
+    """
+
+    if _AER_SHOT_ESTIMATOR is None:
+        raise RuntimeError(
+            "Qiskit Aer Estimator is not available."
+        )
+
+    # Build the same symmetry-preserving AIM ansatz
+    circuit = all_symmetry_ansatzae_qiskit(
+        theta=np.asarray(
+            params,
+            dtype=float,
+        ),
+        n_qubits=n_qubits,
+        n_layers=n_layers,
+        initial_occupations_indices=(
+            initial_occupations_indices
+        ),
+        connected_graphs=connected_graphs,
+        compilation=compilation,
+    )
+
+    # Estimate <H> using finite sampling
+    job = _AER_SHOT_ESTIMATOR.run(
+        circuit,
+        H_pauli,
+        shots=int(shots),
+        seed=int(seed),
+    )
+
+    result = job.result()
+
+    energy = result.values[0]
+
+    return float(
+        np.real(energy)
+    )
+
+
+
+def spsa_minimize_qiskit(
+    cost_function,
+    theta_0,
+    args=(),
+    maxiter=100,
+    seed=0,
+    a=0.15,
+    c=0.10,
+    alpha=0.602,
+    gamma=0.101,
+):
+    """
+    Lightweight SPSA optimizer for finite-shot VQE.
+
+    Uses two objective-function evaluations per iteration,
+    independent of the number of variational parameters.
+    """
+
+    theta = np.asarray(
+        theta_0,
+        dtype=float,
+    ).copy()
+
+    rng = np.random.default_rng(seed)
+
+    # Standard SPSA stability offset.
+    A = 0.1 * maxiter
+
+    nfev = 0
+
+    for k in range(1, int(maxiter) + 1):
+
+        a_k = a / ((k + A) ** alpha)
+        c_k = c / (k ** gamma)
+
+        delta = rng.choice(
+            [-1.0, 1.0],
+            size=theta.size,
+        )
+
+        theta_plus = theta + c_k * delta
+        theta_minus = theta - c_k * delta
+
+        energy_plus = cost_function(
+            theta_plus,
+            *args,
+        )
+
+        energy_minus = cost_function(
+            theta_minus,
+            *args,
+        )
+
+        nfev += 2
+
+        gradient = (
+            (energy_plus - energy_minus)
+            / (2.0 * c_k)
+        ) * delta
+
+        theta = theta - a_k * gradient
+
+        # All ansatz parameters are rotation angles.
+        theta = np.mod(
+            theta,
+            2.0 * np.pi,
+        )
+
+    final_energy = cost_function(
+        theta,
+        *args,
+    )
+
+    nfev += 1
+
+    return OptimizeResult(
+        x=theta,
+        fun=float(final_energy),
+        success=True,
+        status=0,
+        message="SPSA completed requested iterations.",
+        nfev=nfev,
+        njev=0,
+        nit=int(maxiter),
+    )
+
+
+
+
+    
 def optimize_sector_qiskit(
     n_qubits,
     Hmat,
@@ -1673,6 +1869,10 @@ def optimize_sector_qiskit(
     gtol=5e-4,
     maxiter=1_000_000_000,
     compilation="generic",
+    simulation_mode="statevector",
+    H_pauli=None,
+    shots=DEFAULT_SHOTS,
+    seed=1234,
 ):
     """Optimize one fixed charge/spin sector with the Qiskit ansatz.
 
@@ -1698,20 +1898,59 @@ def optimize_sector_qiskit(
         size=n_params,
     )
 
-    opt_args = (
-        Hmat,
-        n_qubits,
-        n_layers,
-        initial_occupations_indices,
-        connected_graphs,
-        compilation,
-    )
+    simulation_mode = simulation_mode.lower()
 
+    if simulation_mode == "statevector":
+    
+        cost_function = (
+            ground_state_cost_function_qiskit
+        )
+    
+        opt_args = (
+            Hmat,
+            n_qubits,
+            n_layers,
+            initial_occupations_indices,
+            connected_graphs,
+            compilation,
+        )
+    
+    elif simulation_mode == "shots":
+    
+        if H_pauli is None:
+            raise ValueError(
+                "H_pauli must be provided when "
+                "simulation_mode='shots'."
+            )
+    
+        cost_function = (
+            ground_state_cost_function_shots_qiskit
+        )
+    
+        opt_args = (
+            H_pauli,
+            n_qubits,
+            n_layers,
+            initial_occupations_indices,
+            connected_graphs,
+            shots,
+            seed,
+            compilation,
+        )
+    
+    else:
+    
+        raise ValueError(
+            "simulation_mode must be either "
+            "'statevector' or 'shots'."
+        )
+
+    
     method = optimizer.upper()
 
     if method == "BFGS":
         result = minimize(
-            ground_state_cost_function_qiskit,
+            cost_function,
             theta_0,
             args=opt_args,
             method="BFGS",
@@ -1723,7 +1962,7 @@ def optimize_sector_qiskit(
 
     elif method == "NELDER-MEAD":
         result = minimize(
-            ground_state_cost_function_qiskit,
+            cost_function,
             theta_0,
             args=opt_args,
             method="Nelder-Mead",
@@ -1739,7 +1978,7 @@ def optimize_sector_qiskit(
 
     elif method == "COBYLA":
         result = minimize(
-            ground_state_cost_function_qiskit,
+            cost_function,
             theta_0,
             args=opt_args,
             method="COBYLA",
@@ -1749,6 +1988,23 @@ def optimize_sector_qiskit(
             },
         )
 
+    elif method == "SPSA":
+        # SPSA uses two energy evaluations per iteration.
+        # Convert the existing maxiter evaluation budget into
+        # approximately the same total number of cost evaluations.
+        spsa_iterations = max(
+            1,
+            int(maxiter) // 2,
+        )
+    
+        result = spsa_minimize_qiskit(
+            cost_function=cost_function,
+            theta_0=theta_0,
+            args=opt_args,
+            maxiter=spsa_iterations,
+            seed=seed,
+        )
+    
     else:
         raise ValueError(
             "Unsupported ground-state optimizer. "
@@ -1756,6 +2012,7 @@ def optimize_sector_qiskit(
         )
 
     return result
+
 
 def solve_vqe_qiskit(
     test_model,
@@ -1766,7 +2023,14 @@ def solve_vqe_qiskit(
     checkpoint_file=None,
     results_file=None,
     display=False,
+    simulation_mode="statevector",
+    shots=DEFAULT_SHOTS,
+    seed=1234,
+    vqe_seed=0,
 ):
+
+    np.random.seed(vqe_seed)
+
     """Search all allowed charge/spin sectors and return the VQE minimum.
 
     This is the Qiskit counterpart of vqe.solve_vqe() plus the sector
@@ -1803,6 +2067,15 @@ def solve_vqe_qiskit(
         0.0,
     )
 
+
+    H_pauli = None
+
+    if simulation_mode.lower() == "shots":
+        H_pauli = openfermion_to_qiskit_hamiltonian(
+            qubit_hamiltonian,
+            n_qubits,
+        )
+        
     sector_to_energy = {}
     sector_to_result = {}
 
@@ -1840,6 +2113,20 @@ def solve_vqe_qiskit(
             optimizer=optimizer,
             gtol=gs_gtol,
             maxiter=maxiter,
+            simulation_mode=simulation_mode,
+            H_pauli=H_pauli,
+            shots=shots,
+            seed=seed,
+        )
+
+        exact_sector_energy = ground_state_cost_function_qiskit(
+            result.x,
+            Hmat,
+            n_qubits,
+            vqe_depth,
+            initial_occupations_indices,
+            connected_graphs,
+            "generic",
         )
 
         key = (z_spin, n_electrons)
@@ -1848,7 +2135,8 @@ def solve_vqe_qiskit(
 
         if display:
             print(
-                f"  -> energy={result.fun:.12f}, "
+                f"  -> measured energy={result.fun:.12f}, "
+                f"exact-at-theta={exact_sector_energy:.12f}, "
                 f"success={result.success}, "
                 f"nfev={getattr(result, 'nfev', 0)}"
             )
@@ -1880,7 +2168,29 @@ def solve_vqe_qiskit(
     vqe_nu = (vqe_charge + vqe_spin) // 2
     vqe_nd = (vqe_charge - vqe_spin) // 2
 
+    minimum_initial_occupations = (
+        get_initial_occupations_indices_qiskit(
+            up_qubit_indices,
+            down_qubit_indices,
+            vqe_nu,
+            vqe_nd,
+        )
+    )
+
+    exact_energy_at_optimum = (
+        ground_state_cost_function_qiskit(
+            minimum_angles,
+            Hmat,
+            n_qubits,
+            vqe_depth,
+            minimum_initial_occupations,
+            connected_graphs,
+            "generic",
+        )
+    )
+
     record_keeping = {
+        
         "local_vqe_success": bool(minimum_result.success),
         "local_vqe_nparams": len(minimum_angles),
         "local_vqe_nfev": int(getattr(minimum_result, "nfev", 0)),
@@ -1900,6 +2210,10 @@ def solve_vqe_qiskit(
         "vqe_spin": vqe_spin,
         "vqe_nu": vqe_nu,
         "vqe_nd": vqe_nd,
+        "simulation_mode": simulation_mode,
+        "shots": int(shots) if simulation_mode.lower() == "shots" else None,
+        "shot_seed": int(seed) if simulation_mode.lower() == "shots" else None,
+        "exact_energy_at_optimum": exact_energy_at_optimum,
         "sector_to_energy": {
             f"spin={int(spin)},charge={int(charge)}": float(energy)
             for (spin, charge), energy in sector_to_energy.items()
@@ -1910,6 +2224,11 @@ def solve_vqe_qiskit(
         print(
             f"Minimum sector (spin, charge)={minimum_sector}, "
             f"energy={minimum_energy:.12f}"
+        )
+    if display:
+        print(
+            f"Exact energy at optimized parameters="
+            f"{exact_energy_at_optimum:.12f}"
         )
 
     return (

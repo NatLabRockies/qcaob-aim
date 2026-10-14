@@ -52,12 +52,14 @@ cd <path_to_aim_repo> # Navigate to the aim-repo
 pip install -r requirements.txt # Install packages within the virtual environment
 
 
-# Run dmft.py to ensure environment is working properly: 
-python dmft.py -s 0 -size 2 -l 2 -t 1e-4 -gs -d
+#3 - Run dmft.py with a 2-site system and exactly 2 VQE layers 
+to verify that the environment and ground-state workflow are working:
+python3 dmft.py -s 0 -size 2 -svd 2 -pel 2 -t 1e-4 -gs -d
 
-# Run scaling experiment on seed 0 with 3 sites with a target error of 1e-4 in the ground state overlap, displaying results,
-# and setting maximum vqe layers at 3
-python dmft.py -s 0 -size 3 -pel 3 -t 1e-4 -gs -d
+#4 - Run a ground-state scaling experiment on seed 0 with 3 sites.
+Test VQE depths from 1 through 3, using a target ground-state 
+overlap error of 1e-4 and displaying the results:
+python3 dmft.py -s 0 -size 3 -svd 1 -pel 3 -t 1e-4 -gs -d
 
 
 # Deactivate virtualenv environment
