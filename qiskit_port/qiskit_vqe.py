@@ -1404,7 +1404,7 @@ def calculate_gf_vqe_qiskit(
     phi_minus_lanczos_kwargs = dict(
         {
             "niter":
-                vqe_krylov_ideal_dim_minus,
+                max(int(vqe_krylov_ideal_dim_minus) - 1, 0),
 
             "u":
                 phi_minus,
@@ -1426,7 +1426,7 @@ def calculate_gf_vqe_qiskit(
     phi_plus_lanczos_kwargs = dict(
         {
             "niter":
-                vqe_krylov_ideal_dim_plus,
+                max(int(vqe_krylov_ideal_dim_plus) - 1, 0),
 
             "u":
                 phi_plus,
